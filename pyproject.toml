@@ -1,0 +1,15 @@
+[project]
+name = "doi"
+version = "0.1.0"
+description = "Data of Interest"
+authors = [
+    { name = "Björn Busse", email = "bj.rn@baerlin.eu" }
+]
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
