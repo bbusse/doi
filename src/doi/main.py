@@ -1,3 +1,23 @@
+import ipaddress
+import logging
+import json
+import os
+import platform
+import socket
+import sqlite3
+import subprocess
+import tempfile
+import requests
+from hnapi import HnApi
+from paho.mqtt import client as mqtt_client
+
+
+def skip_comments(file):
+    for line in file:
+        if not line.strip().startswith('#'):
+            yield line.strip()
+
+
 class APOD:
 
     def __init__(self, api_key="DEMO_KEY", save_dir="/tmp"):
@@ -675,7 +695,8 @@ class System:
             logging.error(f"Failed to determine local address for {ip_address}: {e}")
             return False
 
-    def uptime():
+    @staticmethod
+    def uptime(env):
         p = subprocess.Popen(['uptime'], shell=True,
                          stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT,
