@@ -13,6 +13,10 @@ dependencies = [
     "requests>=2.32.5",
     "paho-mqtt>=2.1.0",
     "py3status @ git+https://github.com/bbusse/py3status@oneshot"
+    ,
+    "google-api-python-client>=2.0.0",
+    "google-auth>=2.0.0",
+    "pytz>=2023.3"
 ]
 
 [build-system]

@@ -79,6 +79,55 @@ class Music:
 class Calendar:
 
     @staticmethod
+    def next_events_today(max_results=5, calendar_id='primary', credentials_path=None):
+        """
+        Fetches the next `max_results` events for the current day from Google Calendar.
+        Args:
+            max_results (int): Number of events to return.
+            calendar_id (str): Google Calendar ID (default: 'primary').
+            credentials_path (str): Path to Google API credentials.json/token.json. If None, uses default location.
+        Returns:
+            list of dicts: [{ 'start': ..., 'end': ..., 'summary': ... }, ...] or None on failure.
+        """
+        try:
+            from datetime import datetime, timedelta
+            import os
+            import pytz
+            from googleapiclient.discovery import build
+            from google.oauth2.credentials import Credentials
+            # Set up credentials
+            if credentials_path is None:
+                credentials_path = os.path.expanduser('~/.config/gcalendar/token.json')
+            creds = Credentials.from_authorized_user_file(credentials_path, ['https://www.googleapis.com/auth/calendar.readonly'])
+            service = build('calendar', 'v3', credentials=creds)
+            # Get time range for today in UTC
+            tz = pytz.UTC
+            now = datetime.now(tz)
+            start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_of_day = start_of_day + timedelta(days=1)
+            time_min = start_of_day.isoformat()
+            time_max = end_of_day.isoformat()
+            events_result = service.events().list(
+                calendarId=calendar_id,
+                timeMin=time_min,
+                timeMax=time_max,
+                maxResults=max_results,
+                singleEvents=True,
+                orderBy='startTime'
+            ).execute()
+            events = events_result.get('items', [])
+            result = []
+            for event in events:
+                start = event['start'].get('dateTime', event['start'].get('date'))
+                end = event['end'].get('dateTime', event['end'].get('date'))
+                summary = event.get('summary', '')
+                result.append({'start': start, 'end': end, 'summary': summary})
+            return result
+        except Exception as e:
+            logging.error(f"Google Calendar fetch failed: {e}")
+            return None
+
+    @staticmethod
     def next_bank_holidays(location="Germany", count=3):
         """
         Fetches the next `count` bank holidays for the given location using the Nager.Date API.
@@ -279,9 +328,7 @@ class MQTT:
         client.connect(self.broker, self.port)
         return client
 
-    def subscribe(self, client: mqtt_client, topic, theme):
-        self.theme = theme
-
+    def subscribe(self, client: mqtt_client, topic, on_message_callback):
         def on_message(client, userdata, msg):
             self.active_msg = ""
             try:
@@ -313,10 +360,10 @@ class MQTT:
                     texts.append(f"{val} °C")
                 else:
                     # Generic dict payload
-                    texts.append(json.dumps(m))
+                    texts.append(json.dumps(m, ensure_ascii=False))
             elif m is not None:
                 # JSON but not dict (e.g. list/number/string)
-                texts.append(json.dumps(m))
+                texts.append(json.dumps(m, ensure_ascii=False))
             else:
                 # Not JSON, raw text
                 if jm:
@@ -325,19 +372,7 @@ class MQTT:
             if not texts:
                 texts = [str(jm)]
 
-            view = Wayland_view(display.res_x,
-                                display.res_y,
-                                len(texts),
-                                self.theme)
-
-            for i in range(len(texts)):
-                if i == 0:
-                    view.s_objects[i]["font_size"] = 64
-                    view.s_objects[i]["alignment"] = "center"
-                else:
-                    view.s_objects[i]["font_size"] = 48
-                    view.s_objects[i]["alignment"] = "center"
-            view.show_text(texts, self.theme.img_bg)
+            on_message_callback(topic, texts)
             self.mqtt_views.append(msg.topic)
 
         client.subscribe(topic)
@@ -571,6 +606,13 @@ whatismyip {
             if matches:
                 result = matches[-1]
 
+        # Decode any unicode escape sequences (e.g., \\u25cf) to actual characters
+        if isinstance(result, str):
+            try:
+                result = bytes(result, "utf-8").decode("unicode_escape")
+            except Exception:
+                pass
+
         logging.info(f"py3status ({self.module_name}) parsed: {result}")
         return result
 
@@ -601,8 +643,7 @@ class System:
                 cmd,
                 stdout=subprocess.PIPE,
                 shell=False,
-                encoding="utf8",
-                env=env
+                encoding="utf8"
             ).communicate()[0]
         except Exception as e:
             logging.error(f"ps failed: {e}")
@@ -703,7 +744,25 @@ class System:
                          encoding="utf8",
                          env=env)
         output, error = p.communicate()
-        return output.strip()
+        # Example: ' 10:23:45 up 1 day,  2:34,  3 users,  load average: 0.00, 0.01, 0.05'
+        line = output.strip()
+        # Remove leading time and 'up'
+        if ' up ' in line:
+            line = line.split(' up ', 1)[1]
+        parts = [p.strip() for p in line.split(',')]
+        # Find the three fields: uptime, users, load
+        result = {"uptime": "", "users": "", "load": ""}
+        if len(parts) >= 3:
+            result["uptime"] = parts[0]
+            # Find the part with 'user' or 'users'
+            for p in parts[1:]:
+                if 'user' in p:
+                    result["users"] = p
+            # The last part(s) are load average
+            result["load"] = ', '.join(parts[-2:]) if 'load' in parts[-2] or 'load' in parts[-1] else parts[-1]
+        else:
+            result["uptime"] = line
+        return result
 
 
 class Weather:
