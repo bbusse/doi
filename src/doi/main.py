@@ -415,21 +415,25 @@ class News:
             logging.error(f"News: Database does not exist {db}")
             return False
 
+        con = None
         try:
-            with sqlite3.connect(db) as con:
-                cur = con.cursor()
-                res = cur.execute(query)
-                r = res.fetchall()
-                for news in r:
-                    logging.info("News: Appending news")
-                    self.news.append({
-                        "feed": news[0],
-                        "title": news[1],
-                        "url": news[2]
-                    })
+            con = sqlite3.connect(db)
+            cur = con.cursor()
+            res = cur.execute(query)
+            r = res.fetchall()
+            for news in r:
+                logging.info("News: Appending news")
+                self.news.append({
+                    "feed": news[0],
+                    "title": news[1],
+                    "url": news[2]
+                })
         except Exception as e:
             logging.error(f"News: sqlite error: {e}")
             return False
+        finally:
+            if con:
+                con.close()
 
     def hn_fetch_top_news(self, nitems):
         n = 0
@@ -540,81 +544,87 @@ whatismyip {
         self.output = {}  # Store latest output per module
 
     def run_module(self):
-        cmd = ['py3status', '-c', self.config_path, '-o']
-        exists = os.path.exists(self.config_path)
-        readable = os.access(self.config_path, os.R_OK)
-
-        logging.info(f"py3status config path: {self.config_path}, exists={exists}, readable={readable}")
-
-        if readable:
-            try:
-                with open(self.config_path, 'r', encoding='utf8') as cf:
-                    logging.info(f"py3status config:\n{cf.read()}")
-            except Exception as e:
-                logging.warning(f"py3status: failed reading config content: {e}")
-
-        # Inherit current env PATH, optionally prepend /venv/bin if present
-        env_run = os.environ.copy()
-        venv_bin = '/venv/bin'
-        if os.path.isdir(venv_bin):
-            env_run['PATH'] = venv_bin + (os.pathsep + env_run['PATH'] if 'PATH' in env_run else '')
-
-        p = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            encoding='utf8',
-            env=env_run
-        )
-        stdout, stderr = p.communicate()
-        logging.info(f"py3status ({self.module_name}):\n{stdout}")
-
-        if stderr:
-            logging.debug(f"py3status stderr ({self.module_name}): {stderr.strip()}")
-
-        data = None
-        if stdout:
-            lines = [l.strip() for l in stdout.splitlines() if l.strip()]
-            tail = []
-            for i in range(len(lines) - 1, -1, -1):
-                tail.insert(0, lines[i])
-                try:
-                    data = json.loads("\n".join(tail))
-                    break
-                except Exception:
-                    continue
-
-        # Extract full_text
-        result = data
         try:
-            if isinstance(data, dict) and 'full_text' in data:
-                result = data['full_text']
-            elif isinstance(data, list):
-                blocks = data[-1] if (data and isinstance(data[-1], list)) else data
-                if isinstance(blocks, list):
-                    for blk in reversed(blocks):
-                        if isinstance(blk, dict) and 'full_text' in blk:
-                            result = blk['full_text']
-                            break
-        except Exception:
-            pass
+            cmd = ['py3status', '-c', self.config_path, '-o']
+            exists = os.path.exists(self.config_path)
+            readable = os.access(self.config_path, os.R_OK)
 
-        # Fallback: regex the last full_text from raw stdout
-        if result is None:
-            import re
-            matches = re.findall(r'"full_text"\s*:\s*"([^"]+)"', stdout or '')
-            if matches:
-                result = matches[-1]
+            logging.info(f"py3status config path: {self.config_path}, exists={exists}, readable={readable}")
 
-        # Decode any unicode escape sequences (e.g., \\u25cf) to actual characters
-        if isinstance(result, str):
+            if readable:
+                try:
+                    with open(self.config_path, 'r', encoding='utf8') as cf:
+                        logging.info(f"py3status config:\n{cf.read()}")
+                except Exception as e:
+                    logging.warning(f"py3status: failed reading config content: {e}")
+
+            # Inherit current env PATH, optionally prepend /venv/bin if present
+            env_run = os.environ.copy()
+            venv_bin = '/venv/bin'
+            if os.path.isdir(venv_bin):
+                env_run['PATH'] = venv_bin + (os.pathsep + env_run['PATH'] if 'PATH' in env_run else '')
+
+            p = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                encoding='utf8',
+                env=env_run
+            )
+            stdout, stderr = p.communicate()
+            logging.info(f"py3status ({self.module_name}):\n{stdout}")
+
+            if stderr:
+                logging.debug(f"py3status stderr ({self.module_name}): {stderr.strip()}")
+
+            data = None
+            if stdout:
+                lines = [l.strip() for l in stdout.splitlines() if l.strip()]
+                tail = []
+                for i in range(len(lines) - 1, -1, -1):
+                    tail.insert(0, lines[i])
+                    try:
+                        data = json.loads("\n".join(tail))
+                        break
+                    except Exception:
+                        continue
+
+            # Extract full_text
+            result = data
             try:
-                result = bytes(result, "utf-8").decode("unicode_escape")
+                if isinstance(data, dict) and 'full_text' in data:
+                    result = data['full_text']
+                elif isinstance(data, list):
+                    blocks = data[-1] if (data and isinstance(data[-1], list)) else data
+                    if isinstance(blocks, list):
+                        for blk in reversed(blocks):
+                            if isinstance(blk, dict) and 'full_text' in blk:
+                                result = blk['full_text']
+                                break
             except Exception:
                 pass
 
-        logging.info(f"py3status ({self.module_name}) parsed: {result}")
-        return result
+            # Fallback: regex the last full_text from raw stdout
+            if result is None:
+                import re
+                matches = re.findall(r'"full_text"\s*:\s*"([^"]+)"', stdout or '')
+                if matches:
+                    result = matches[-1]
+
+            # Decode any unicode escape sequences (e.g., \\u25cf) to actual characters
+            if isinstance(result, str):
+                try:
+                    result = bytes(result, "utf-8").decode("unicode_escape")
+                except Exception:
+                    pass
+
+            logging.info(f"py3status ({self.module_name}) parsed: {result}")
+            return result
+        finally:
+            try:
+                os.remove(self.config_path)
+            except Exception:
+                pass
 
     def write_config(self):
         tmp = tempfile.NamedTemporaryFile(delete=False, mode='w+', encoding='utf-8')
@@ -738,7 +748,9 @@ class System:
 
     @staticmethod
     def uptime(env):
-        p = subprocess.Popen(['uptime'], shell=True,
+        import re
+
+        p = subprocess.Popen(['uptime'],
                          stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT,
                          encoding="utf8",
@@ -749,19 +761,23 @@ class System:
         # Remove leading time and 'up'
         if ' up ' in line:
             line = line.split(' up ', 1)[1]
-        parts = [p.strip() for p in line.split(',')]
-        # Find the three fields: uptime, users, load
+
         result = {"uptime": "", "users": "", "load": ""}
-        if len(parts) >= 3:
+
+        # Split off the load average first, since it contains its own commas
+        # and would otherwise get shredded by a naive comma-split below.
+        load_match = re.search(r'load averages?:\s*(.+)$', line, re.IGNORECASE)
+        if load_match:
+            result["load"] = f"load average: {load_match.group(1).strip()}"
+            line = line[:load_match.start()]
+
+        parts = [p.strip() for p in line.split(',') if p.strip()]
+        if parts:
             result["uptime"] = parts[0]
             # Find the part with 'user' or 'users'
             for p in parts[1:]:
                 if 'user' in p:
                     result["users"] = p
-            # The last part(s) are load average
-            result["load"] = ', '.join(parts[-2:]) if 'load' in parts[-2] or 'load' in parts[-1] else parts[-1]
-        else:
-            result["uptime"] = line
         return result
 
 
