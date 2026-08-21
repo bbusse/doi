@@ -655,6 +655,9 @@ class System:
                 shell=False,
                 encoding="utf8"
             ).communicate()[0]
+        except FileNotFoundError:
+            logging.warning("ps not found, falling back to /proc")
+            ps = System._processes_from_proc()
         except Exception as e:
             logging.error(f"ps failed: {e}")
             ps = ""
@@ -662,6 +665,32 @@ class System:
             lines = ps.splitlines()
             return "\n".join(lines[:max(0, limit)])
         return ps
+
+    def _processes_from_proc():
+        try:
+            entries = sorted(
+                (e for e in os.scandir('/proc') if e.name.isdigit()),
+                key=lambda e: int(e.name)
+            )
+        except OSError as e:
+            return f"Process list unavailable: {e}"
+
+        lines = ["PID    COMMAND"]
+        for entry in entries:
+            pid = entry.name
+            try:
+                with open(f'/proc/{pid}/cmdline', encoding='utf8') as f:
+                    cmdline = f.read().replace('\x00', ' ').strip()
+                if not cmdline:
+                    with open(f'/proc/{pid}/status', encoding='utf8') as f:
+                        for line in f:
+                            if line.startswith('Name:'):
+                                cmdline = '[' + line.split(':', 1)[1].strip() + ']'
+                                break
+                lines.append(f"{pid:<6} {cmdline}")
+            except OSError:
+                continue
+        return "\n".join(lines)
 
     def os_release():
         data = ""
@@ -731,7 +760,7 @@ class System:
             ip_obj = ipaddress.ip_address(ip_address)
         except ValueError:
             logging.warning(f"{ip_address} is an invalid IP address")
-            return False
+            return ""
 
         family = socket.AF_INET6 if ip_obj.version == 6 else socket.AF_INET
         try:
@@ -741,11 +770,11 @@ class System:
                     s.connect((ip_address, 80))
                 except OSError as e:
                     logging.info(f"{ip_address} is unreachable or no route: {e}")
-                    return False
+                    return ""
                 return s.getsockname()[0]
         except Exception as e:
             logging.error(f"Failed to determine local address for {ip_address}: {e}")
-            return False
+            return ""
 
     @staticmethod
     def uptime(env):
