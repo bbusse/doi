@@ -672,7 +672,8 @@ class System:
                         data = line.split("=", 1)[1].strip().strip('"')
                         break
         except FileNotFoundError:
-            logging.warning("/etc/os-release not found")
+            logging.warning("/etc/os-release not found, falling back to uname")
+            data = f"{platform.system()} {platform.release()}"
         except Exception as e:
             logging.error(f"Failed reading /etc/os-release: {e}")
         return data
@@ -750,12 +751,17 @@ class System:
     def uptime(env):
         import re
 
-        p = subprocess.Popen(['uptime'],
-                         stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT,
-                         encoding="utf8",
-                         env=env)
-        output, error = p.communicate()
+        try:
+            p = subprocess.Popen(['uptime'],
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT,
+                             encoding="utf8",
+                             env=env)
+            output, error = p.communicate()
+        except FileNotFoundError:
+            logging.warning("uptime not found, falling back to /proc")
+            return System._uptime_from_proc()
+
         # Example: ' 10:23:45 up 1 day,  2:34,  3 users,  load average: 0.00, 0.01, 0.05'
         line = output.strip()
         # Remove leading time and 'up'
@@ -778,6 +784,31 @@ class System:
             for p in parts[1:]:
                 if 'user' in p:
                     result["users"] = p
+        return result
+
+    def _uptime_from_proc():
+        result = {"uptime": "", "users": "", "load": ""}
+        try:
+            with open('/proc/uptime', encoding='utf-8') as f:
+                seconds = int(float(f.read().split()[0]))
+            days, seconds = divmod(seconds, 86400)
+            hours, seconds = divmod(seconds, 3600)
+            minutes = seconds // 60
+            parts = []
+            if days:
+                parts.append(f"{days} day{'s' if days != 1 else ''}")
+            parts.append(f"{hours}:{minutes:02d}")
+            result["uptime"] = ", ".join(parts)
+        except Exception as e:
+            logging.error(f"Failed reading /proc/uptime: {e}")
+
+        try:
+            with open('/proc/loadavg', encoding='utf-8') as f:
+                load1, load5, load15 = f.read().split()[:3]
+            result["load"] = f"load average: {load1}, {load5}, {load15}"
+        except Exception as e:
+            logging.error(f"Failed reading /proc/loadavg: {e}")
+
         return result
 
 
