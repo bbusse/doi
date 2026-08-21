@@ -486,6 +486,40 @@ class News:
             n += 1
 
 
+class RSSFeed:
+    ATOM_NS = "http://www.w3.org/2005/Atom"
+
+    def __init__(self, url):
+        self._items = []
+        try:
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+            channel = root.find("channel")
+            if channel is not None:
+                feed_title = (channel.findtext("title") or "").strip()
+                for item in channel.findall("item"):
+                    title = (item.findtext("title") or "").strip()
+                    link = (item.findtext("link") or "").strip()
+                    if title:
+                        self._items.append({"feed": feed_title, "title": title, "url": link})
+            else:
+                feed_title = (root.findtext(f"{{{self.ATOM_NS}}}title") or "").strip()
+                for entry in root.findall(f"{{{self.ATOM_NS}}}entry"):
+                    title = (entry.findtext(f"{{{self.ATOM_NS}}}title") or "").strip()
+                    link_el = entry.find(f"{{{self.ATOM_NS}}}link")
+                    link = (link_el.get("href", "") if link_el is not None else "").strip()
+                    if title:
+                        self._items.append({"feed": feed_title, "title": title, "url": link})
+            random.shuffle(self._items)
+            logging.info(f"RSS: Fetched {len(self._items)} items from {url}")
+        except Exception as e:
+            logging.error(f"RSS: Failed to fetch {url}: {e}")
+
+    def news_item(self):
+        return self._items.pop(0) if self._items else None
+
+
 class OTD:
 
     def __init__(self, sources):
