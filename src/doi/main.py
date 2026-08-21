@@ -3,10 +3,12 @@ import logging
 import json
 import os
 import platform
+import random
 import socket
 import sqlite3
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 import requests
 from hnapi import HnApi
 from paho.mqtt import client as mqtt_client
@@ -384,8 +386,10 @@ class News:
 
     def __init__(self, sources):
         self.news = []
-        self.sqlite_select(sources["db"], "SELECT feeds.title, entries.title, entries.link, entries.pub_date FROM entries INNER JOIN feeds ON entries.feed_id = feeds.id ORDER BY pub_date DESC LIMIT 9")
-        #self.hn_fetch_top_news(10)
+        if sources.get("rss"):
+            self.rss_fetch(sources["rss"])
+        elif sources.get("db"):
+            self.sqlite_select(sources["db"], "SELECT feeds.title, entries.title, entries.link, entries.pub_date FROM entries INNER JOIN feeds ON entries.feed_id = feeds.id ORDER BY pub_date DESC LIMIT 9")
 
     # news_item returns a single news text
     # from the previously fetched ones
@@ -434,6 +438,38 @@ class News:
         finally:
             if con:
                 con.close()
+
+    def rss_fetch(self, url):
+        ATOM_NS = "http://www.w3.org/2005/Atom"
+        try:
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+        except Exception as e:
+            logging.error(f"RSS: Failed to fetch {url}: {e}")
+            return
+
+        # RSS 2.0
+        channel = root.find("channel")
+        if channel is not None:
+            feed_title = (channel.findtext("title") or "").strip()
+            for item in channel.findall("item"):
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                if title:
+                    self.news.append({"feed": feed_title, "title": title, "url": link})
+        else:
+            # Atom
+            feed_title = (root.findtext(f"{{{ATOM_NS}}}title") or "").strip()
+            for entry in root.findall(f"{{{ATOM_NS}}}entry"):
+                title = (entry.findtext(f"{{{ATOM_NS}}}title") or "").strip()
+                link_el = entry.find(f"{{{ATOM_NS}}}link")
+                link = (link_el.get("href", "") if link_el is not None else "").strip()
+                if title:
+                    self.news.append({"feed": feed_title, "title": title, "url": link})
+
+        random.shuffle(self.news)
+        logging.info(f"RSS: Fetched {len(self.news)} items from {url}")
 
     def hn_fetch_top_news(self, nitems):
         n = 0
