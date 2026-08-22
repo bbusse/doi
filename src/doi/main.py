@@ -979,3 +979,23 @@ class Weather:
         except Exception as e:
             logging.error(f"Error fetching UV index: {e}")
         return None
+
+    @staticmethod
+    def uv_risk(uv_index):
+        try:
+            uv = int(float(uv_index))
+        except (TypeError, ValueError):
+            return None
+
+        levels = [
+            (2,  "Low",       "No protection needed",            "No protection needed"),
+            (5,  "Moderate",  "Sunscreen recommended",           "Sunscreen and hat recommended"),
+            (7,  "High",      "Sunscreen essential, seek shade", "Limit midday exposure, hat and sunscreen"),
+            (10, "Very High", "Avoid midday sun",                "Avoid midday sun, stay in shade"),
+        ]
+
+        for max_uv, label, adult, children in levels:
+            if uv <= max_uv:
+                return f"UV {uv} ({label}) — Adults: {adult}. Children: {children}."
+
+        return f"UV {uv} (Extreme) — Adults: Avoid sun exposure. Children: Keep indoors during peak hours."
