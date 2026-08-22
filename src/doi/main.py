@@ -517,7 +517,15 @@ class RSSFeed:
             logging.error(f"RSS: Failed to fetch {url}: {e}")
 
     def news_item(self):
-        return self._items.pop(0) if self._items else None
+        if not self._items:
+            return None
+
+        # Rotate, so repeated calls cycle through the feed
+        # instead of consuming it and then running dry
+        item = self._items.pop(0)
+        self._items.append(item)
+
+        return item
 
 
 class OTD:
