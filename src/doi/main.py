@@ -825,6 +825,88 @@ class System:
             logging.error(f"Failed reading /etc/resolv.conf: {e}")
         return data
 
+    tcp_states = {"01": "ESTABLISHED",
+                  "02": "SYN_SENT",
+                  "03": "SYN_RECV",
+                  "04": "FIN_WAIT1",
+                  "05": "FIN_WAIT2",
+                  "06": "TIME_WAIT",
+                  "07": "CLOSE",
+                  "08": "CLOSE_WAIT",
+                  "09": "LAST_ACK",
+                  "0A": "LISTEN",
+                  "0B": "CLOSING"}
+
+    @staticmethod
+    def net_hex_address(hex_address):
+        if len(hex_address) == 8:
+            return socket.inet_ntop(socket.AF_INET,
+                                    bytes.fromhex(hex_address)[::-1])
+        if len(hex_address) == 32:
+            packed = b"".join(bytes.fromhex(hex_address[i:i + 8])[::-1]
+                              for i in range(0, 32, 8))
+            return socket.inet_ntop(socket.AF_INET6, packed)
+
+        return hex_address
+
+    @staticmethod
+    def net_endpoint(field):
+        address, _, port = field.rpartition(':')
+        try:
+            port = int(port, 16)
+        except ValueError:
+            return field
+
+        return f"[{System.net_hex_address(address)}]:{port}" \
+            if len(address) == 32 else f"{System.net_hex_address(address)}:{port}"
+
+    @staticmethod
+    def net_socket_list():
+        sockets = []
+        for proto, path in (("tcp", "/proc/net/tcp"), ("tcp", "/proc/net/tcp6"),
+                            ("udp", "/proc/net/udp"), ("udp", "/proc/net/udp6")):
+            try:
+                with open(path, encoding='utf-8') as f:
+                    next(f, None)
+                    for line in f:
+                        fields = line.split()
+                        if len(fields) < 4:
+                            continue
+                        local = System.net_endpoint(fields[1])
+                        remote = System.net_endpoint(fields[2])
+                        if proto == "udp":
+                            state = "UNCONN" if remote.endswith(":0") else "ESTABLISHED"
+                        else:
+                            state = System.tcp_states.get(fields[3].upper(), fields[3])
+                        sockets.append({"proto": proto,
+                                        "local": local,
+                                        "remote": remote,
+                                        "state": state})
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                logging.error(f"Failed reading {path}: {e}")
+
+        return sockets
+
+    @staticmethod
+    def net_sockets(limit=0):
+        sockets = System.net_socket_list()
+        if not sockets:
+            return ""
+
+        order = {"LISTEN": 0, "UNCONN": 1}
+        sockets.sort(key=lambda s: (order.get(s["state"], 2),
+                                    s["proto"], s["local"]))
+        shown = sockets[:limit] if limit else sockets
+
+        lines = [f"{s['proto']:<4} {s['local']:<26} {s['remote']:<26} {s['state']}"
+                 for s in shown]
+        if limit and len(sockets) > limit:
+            lines.append(f"... {len(sockets) - limit} more of {len(sockets)}")
+
+        return "\n".join(lines)
+
     def net_valid_ip_address(ip_address):
         try:
             ipaddress.ip_address(ip_address)
