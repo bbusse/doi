@@ -7,6 +7,7 @@ import random
 import socket
 import sqlite3
 import subprocess
+import threading
 import tempfile
 import xml.etree.ElementTree as ET
 import requests
@@ -490,7 +491,25 @@ class RSSFeed:
     ATOM_NS = "http://www.w3.org/2005/Atom"
 
     def __init__(self, url):
+        self.url = url
         self._items = []
+        self._fetched = False
+        self._lock = threading.Lock()
+
+    def item_count(self):
+        return len(self._items)
+
+    # Fetched on first use rather than in __init__, so building a playlist
+    # never blocks on the network
+    def fetch(self):
+        with self._lock:
+            if self._fetched:
+                return
+            self._fetched = True
+            self._parse()
+
+    def _parse(self):
+        url = self.url
         try:
             resp = requests.get(url, timeout=10)
             resp.raise_for_status()
@@ -520,6 +539,7 @@ class RSSFeed:
             logging.error(f"RSS: Failed to fetch {url}: {e}")
 
     def news_item(self):
+        self.fetch()
         if not self._items:
             return None
 
@@ -827,6 +847,56 @@ class System:
         except Exception as e:
             logging.error(f"Failed reading /etc/resolv.conf: {e}")
         return data
+
+    @staticmethod
+    def process_cpu_times():
+        ticks = os.sysconf('SC_CLK_TCK')
+        procs = []
+        for entry in os.listdir('/proc'):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat", encoding='utf-8') as f:
+                    data = f.read()
+            except OSError:
+                continue
+
+            # comm is parenthesised and may itself contain spaces or parens,
+            # so the last closing paren ends it and the numbers follow
+            start, end = data.find('('), data.rfind(')')
+            if start < 0 or end < 0:
+                continue
+
+            fields = data[end + 2:].split()
+            try:
+                cpu_s = (int(fields[11]) + int(fields[12])) / ticks
+            except (IndexError, ValueError, ZeroDivisionError):
+                continue
+
+            procs.append({"pid": int(entry),
+                          "name": data[start + 1:end],
+                          "cpu_s": cpu_s})
+
+        return procs
+
+    @staticmethod
+    def top(limit=0):
+        procs = System.process_cpu_times()
+        if not procs:
+            return ""
+
+        procs.sort(key=lambda p: p["cpu_s"], reverse=True)
+        shown = procs[:limit] if limit else procs
+
+        lines = [f"{'PID':>7}  {'CPU TIME':>10}  COMMAND"]
+        for proc in shown:
+            minutes, seconds = divmod(proc["cpu_s"], 60)
+            lines.append(f"{proc['pid']:>7}  {int(minutes):>6}m{seconds:04.1f}s"
+                         f"  {proc['name']}")
+        if limit and len(procs) > limit:
+            lines.append(f"... {len(procs) - limit} more of {len(procs)}")
+
+        return "\n".join(lines)
 
     tcp_states = {"01": "ESTABLISHED",
                   "02": "SYN_SENT",
