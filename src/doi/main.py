@@ -511,6 +511,9 @@ class RSSFeed:
                     link = (link_el.get("href", "") if link_el is not None else "").strip()
                     if title:
                         self._items.append({"feed": feed_title, "title": title, "url": link})
+            # Feed order is the ranking, so it is recorded before shuffling
+            for rank, item in enumerate(self._items, start=1):
+                item["rank"] = rank
             random.shuffle(self._items)
             logging.info(f"RSS: Fetched {len(self._items)} items from {url}")
         except Exception as e:
