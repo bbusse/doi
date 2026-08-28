@@ -1,3 +1,4 @@
+import csv
 import ipaddress
 import logging
 import json
@@ -8,6 +9,7 @@ import socket
 import sqlite3
 import subprocess
 import threading
+import time
 import tempfile
 import xml.etree.ElementTree as ET
 import requests
@@ -61,6 +63,173 @@ class APOD:
             return img_path, desc
         except Exception as e:
             logging.error(f"APOD: Error fetching APOD: {e}")
+            return None, None
+
+
+class Art:
+    """
+    Base for the collection sources. Each one picks a work at random and
+    returns a local image path plus a caption.
+    """
+
+    def __init__(self, save_dir="/tmp", width=1280, height=800):
+        self.save_dir = save_dir
+        self.width = width
+        self.height = height
+
+    def save_image(self, url, name, timeout=20):
+        r = requests.get(url, timeout=timeout)
+        if r.status_code != 200:
+            logging.error(f"Art: Failed to download image: {r.status_code}")
+
+            return None
+
+        path = os.path.join(self.save_dir, name)
+        with open(path, "wb") as f:
+            f.write(r.content)
+
+        return path
+
+    def art_data(self):
+        raise NotImplementedError
+
+
+class ArtNGA(Art):
+    """
+    The National Gallery of Art, from its open data.
+
+    There is no api, only csv, and the file naming the images is 85 MB, far too
+    much to pull for one picture. It is served with range support though, so a
+    read of a few kilobytes at a random offset lands in the middle of some row,
+    and the first complete row after that is as good as any other.
+    """
+
+    images_csv = ("https://raw.githubusercontent.com/NationalGalleryOfArt/"
+                  "opendata/main/data/published_images.csv")
+    iiif = "https://api.nga.gov/iiif/{uuid}/full/!{width},{height}/0/default.jpg"
+    window = 8192
+    # Without this the server gzips, content-length describes the compressed
+    # file and a byte range lands in the middle of a gzip stream, which is not
+    # itself decompressible
+    plain = {"Accept-Encoding": "identity"}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._size = None
+
+    def csv_size(self):
+        if self._size is None:
+            r = requests.head(self.images_csv, timeout=10,
+                              allow_redirects=True, headers=self.plain)
+            r.raise_for_status()
+            self._size = int(r.headers["content-length"])
+
+        return self._size
+
+    def random_row(self):
+        size = self.csv_size()
+        start = random.randint(self.window, max(size - self.window, self.window + 1))
+        headers = dict(self.plain)
+        headers["Range"] = f"bytes={start}-{start + self.window}"
+        r = requests.get(self.images_csv, timeout=15, headers=headers)
+        r.raise_for_status()
+        # The read starts mid-row, so the first line is a fragment
+        for line in r.text.splitlines()[1:]:
+            fields = next(csv.reader([line]), [])
+            # uuid, iiifurl, iiifthumburl, viewtype, sequence, width, height,
+            # maxpixels, openaccess, created, modified, tmsid, assistivetext
+            if len(fields) < 13 or fields[3] != "primary" or fields[8] != "1":
+                continue
+            if not fields[0] or "-" not in fields[0]:
+                continue
+
+            return {"uuid": fields[0], "text": fields[12]}
+
+        return None
+
+    def art_data(self):
+        try:
+            row = self.random_row()
+            if not row:
+                logging.error("Art: No usable row in the sampled range")
+
+                return None, None
+
+            url = self.iiif.format(uuid=row["uuid"], width=self.width,
+                                   height=self.height)
+            path = self.save_image(url, "art-nga.jpg")
+
+            return path, (row["text"] or "National Gallery of Art")
+        except Exception as e:
+            logging.error(f"Art: Error fetching from the National Gallery: {e}")
+
+            return None, None
+
+
+class ArtMet(Art):
+    """
+    The Metropolitan Museum of Art, from its public api.
+
+    The search returns every object id that carries an image in one response,
+    so a random pick needs that list and then one object lookup.
+    """
+
+    api = "https://collectionapi.metmuseum.org/public/collection/v1"
+    search_terms = ("painting", "drawing", "sculpture", "portrait",
+                    "landscape", "still life")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._ids = []
+
+    def object_ids(self):
+        if not self._ids:
+            term = random.choice(self.search_terms)
+            r = requests.get(f"{self.api}/search",
+                             params={"hasImages": "true", "q": term},
+                             timeout=15)
+            r.raise_for_status()
+            self._ids = r.json().get("objectIDs") or []
+
+        return self._ids
+
+    def random_object(self, tries=5):
+        ids = self.object_ids()
+        if not ids:
+            return None
+
+        for _ in range(tries):
+            r = requests.get(f"{self.api}/objects/{random.choice(ids)}",
+                             timeout=15)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            # web-large is plenty for a display and a fraction of the original
+            image = data.get("primaryImageSmall") or data.get("primaryImage")
+            if image:
+                return {"image": image,
+                        "title": data.get("title") or "",
+                        "artist": data.get("artistDisplayName") or "",
+                        "date": data.get("objectDate") or ""}
+
+        return None
+
+    def art_data(self):
+        try:
+            work = self.random_object()
+            if not work:
+                logging.error("Art: No object with an image found")
+
+                return None, None
+
+            path = self.save_image(work["image"], "art-met.jpg")
+            caption = ", ".join(p for p in (work["title"], work["artist"],
+                                            work["date"]) if p)
+
+            return path, (caption or "The Metropolitan Museum of Art")
+        except Exception as e:
+            logging.error(f"Art: Error fetching from the Met: {e}")
+
             return None, None
 
 
@@ -851,6 +1020,7 @@ class System:
     @staticmethod
     def process_cpu_times():
         ticks = os.sysconf('SC_CLK_TCK')
+        page_size = os.sysconf('SC_PAGE_SIZE')
         procs = []
         for entry in os.listdir('/proc'):
             if not entry.isdigit():
@@ -870,14 +1040,168 @@ class System:
             fields = data[end + 2:].split()
             try:
                 cpu_s = (int(fields[11]) + int(fields[12])) / ticks
+                rss_b = int(fields[21]) * page_size
             except (IndexError, ValueError, ZeroDivisionError):
                 continue
 
             procs.append({"pid": int(entry),
                           "name": data[start + 1:end],
-                          "cpu_s": cpu_s})
+                          "cpu_s": cpu_s,
+                          "rss_b": rss_b})
 
         return procs
+
+    @staticmethod
+    def mem_data():
+        fields = {}
+        try:
+            with open("/proc/meminfo", encoding="utf-8") as f:
+                for line in f:
+                    name, _, rest = line.partition(":")
+                    value = rest.split()
+                    if value:
+                        fields[name] = int(value[0]) * 1024
+        except (OSError, ValueError):
+            return ""
+
+        total = fields.get("MemTotal")
+        available = fields.get("MemAvailable")
+        if not total:
+            return ""
+
+        text = f"Memory: {System.human_bytes(total)} total"
+        if available is not None:
+            text += (f", {System.human_bytes(total - available)} used"
+                     f", {System.human_bytes(available)} available")
+
+        swap_total = fields.get("SwapTotal")
+        swap_free = fields.get("SwapFree")
+        if swap_total:
+            used = swap_total - (swap_free or 0)
+            text += (f" -- Swap: {System.human_bytes(swap_total)} total"
+                     f", {System.human_bytes(used)} used")
+
+        return text
+
+    @staticmethod
+    def human_bytes(count):
+        for unit in ("B", "K", "M", "G"):
+            if count < 1024 or unit == "G":
+                return f"{count:.0f}{unit}" if unit == "B" else f"{count:.1f}{unit}"
+            count /= 1024
+
+    # One walk answers both the biggest files and the biggest directories, so
+    # the two views share it rather than each paying for a traversal
+    _sizes_cache = {}
+    _sizes_lock = threading.Lock()
+
+    @staticmethod
+    def human_bytes(n):
+        for unit in ("B", "K", "M", "G", "T"):
+            if n < 1024 or unit == "T":
+                return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+            n /= 1024
+
+    @staticmethod
+    def scan_sizes(path="/", limit=12, budget_s=20.0, max_entries=2_000_000):
+        """
+        Walks path once and returns the largest files and directories under it.
+
+        Sizes are blocks actually used rather than apparent size, which is what
+        fills a disk and what du reports. The walk stays on the one filesystem
+        it started on, so it never wanders into /proc, /sys or /dev, and it
+        follows no symlinks, so nothing is counted twice and nothing loops.
+        """
+        with System._sizes_lock:
+            cached = System._sizes_cache.get((path, limit))
+        if cached:
+            return cached
+
+        started = time.time()
+        try:
+            root_dev = os.stat(path).st_dev
+        except OSError as e:
+            logging.error(f"scan_sizes: Cannot stat {path}: {e}")
+
+            return {"files": [], "dirs": [], "truncated": False, "path": path}
+
+        files = []
+        # Every directory on the way up gets the size of what is below it
+        totals = {}
+        seen = 0
+        truncated = False
+        stack = [path]
+        while stack:
+            if time.time() - started > budget_s or seen > max_entries:
+                truncated = True
+                break
+
+            current = stack.pop()
+            try:
+                entries = list(os.scandir(current))
+            except OSError:
+                continue
+
+            for entry in entries:
+                seen += 1
+                try:
+                    if entry.is_symlink():
+                        continue
+                    st = entry.stat(follow_symlinks=False)
+                    if st.st_dev != root_dev:
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+                        continue
+                except OSError:
+                    continue
+
+                size = st.st_blocks * 512
+                files.append((size, entry.path))
+                parent = current
+                while True:
+                    totals[parent] = totals.get(parent, 0) + size
+                    if parent == path or parent in ("/", ""):
+                        break
+                    parent = os.path.dirname(parent)
+
+        files.sort(reverse=True)
+        dirs = sorted(((v, k) for k, v in totals.items()), reverse=True)
+        result = {"files": files[:limit], "dirs": dirs[:limit],
+                  "truncated": truncated, "path": path,
+                  "took_s": time.time() - started}
+        with System._sizes_lock:
+            System._sizes_cache[(path, limit)] = result
+
+        return result
+
+    @staticmethod
+    def biggest_files(path="/", limit=12):
+        scan = System.scan_sizes(path, limit)
+        if not scan["files"]:
+            return f"No files found under {path}"
+
+        lines = [f"{'SIZE':>9}  FILE"]
+        for size, name in scan["files"]:
+            lines.append(f"{System.human_bytes(size):>9}  {name}")
+        if scan["truncated"]:
+            lines.append("... scan stopped early, results are partial")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def biggest_dirs(path="/", limit=12):
+        scan = System.scan_sizes(path, limit)
+        if not scan["dirs"]:
+            return f"No directories found under {path}"
+
+        lines = [f"{'SIZE':>9}  DIRECTORY"]
+        for size, name in scan["dirs"]:
+            lines.append(f"{System.human_bytes(size):>9}  {name}")
+        if scan["truncated"]:
+            lines.append("... scan stopped early, results are partial")
+
+        return "\n".join(lines)
 
     @staticmethod
     def top(limit=0):
@@ -888,10 +1212,11 @@ class System:
         procs.sort(key=lambda p: p["cpu_s"], reverse=True)
         shown = procs[:limit] if limit else procs
 
-        lines = [f"{'PID':>7}  {'CPU TIME':>10}  COMMAND"]
+        lines = [f"{'PID':>7}  {'CPU TIME':>10}  {'MEM':>7}  COMMAND"]
         for proc in shown:
             minutes, seconds = divmod(proc["cpu_s"], 60)
             lines.append(f"{proc['pid']:>7}  {int(minutes):>6}m{seconds:04.1f}s"
+                         f"  {System.human_bytes(proc['rss_b']):>7}"
                          f"  {proc['name']}")
         if limit and len(procs) > limit:
             lines.append(f"... {len(procs) - limit} more of {len(procs)}")
