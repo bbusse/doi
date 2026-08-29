@@ -36,9 +36,11 @@ class APOD:
 
     def apod_data(self):
         """
-        Downloads NASA's Astronomy Picture of the Day (APOD) and returns its description text.
+        Downloads NASA's Astronomy Picture of the Day (APOD).
         Returns:
-            tuple: (image_path, description_string) or (None, None) on failure.
+            tuple: (image_path, meta) or (None, None) on failure. meta is the
+            same shape the art sources return, so Art.caption formats it:
+            title, artist (the credit), date, source and a description.
         """
         apod_url = f"https://api.nasa.gov/planetary/apod?api_key={self.api_key}"
         try:
@@ -48,7 +50,6 @@ class APOD:
                 return None, None
             data = resp.json()
             img_url = data.get("hdurl") or data.get("url")
-            desc = data.get("explanation", "")
             if not img_url:
                 logging.error("APOD: No image URL found in response")
                 return None, None
@@ -64,8 +65,13 @@ class APOD:
             with open(img_path, "wb") as f:
                 f.write(img_resp.content)
 
-            # Return image path and description string
-            return img_path, desc
+            meta = {"title": data.get("title", ""),
+                    "artist": (data.get("copyright") or "").strip(),
+                    "date": data.get("date", ""),
+                    "source": "NASA APOD",
+                    "description": data.get("explanation", "")}
+
+            return img_path, meta
         except Exception as e:
             logging.error(f"APOD: Error fetching APOD: {e}")
             return None, None
@@ -966,27 +972,38 @@ class OTD:
     user_agent = f"doi/{__version__} (https://github.com/bbusse/doi)"
 
     def __init__(self, sources):
+        self.events = []
+        self.fetched_on = None
+
+    # Lazy and dated, so building a playlist never blocks on the network and
+    # the view follows the calendar instead of the day the process started.
+    # A failed refetch keeps the previous day's events rather than nothing
+    def fetch(self):
         import datetime
         today = datetime.date.today()
-        month = today.month
-        day = today.day
-        url = f"https://en.wikipedia.org/api/rest_v1/feed/onthisday/events/{month}/{day}"
-        self.events = []
+        if self.fetched_on == today and self.events:
+            return
 
+        url = ("https://en.wikipedia.org/api/rest_v1/feed/onthisday/events/"
+               f"{today.month}/{today.day}")
         try:
             response = requests.get(url, timeout=10,
                                     headers={"User-Agent": self.user_agent})
             if response.status_code == 200:
-                data = response.json()
-                for event in data.get("events", []):
-                    logging.info(f"{event['year']}: {event['text']}")
-                    self.events.append(event)
+                events = response.json().get("events", [])
+                if events:
+                    self.events = events
+                    self.fetched_on = today
+                logging.info(f"otd: Fetched {len(events)} events for "
+                             f"{today.month}/{today.day}")
             else:
-                logging.error(f"Failed to fetch otd data: HTTP {response.status_code}")
+                logging.error("Failed to fetch otd data: "
+                              f"HTTP {response.status_code}")
         except Exception as e:
             logging.error(f"Failed to fetch otd data: {e}")
 
     def otd_item(self):
+        self.fetch()
         if not self.events:
             return None
 
@@ -1066,7 +1083,10 @@ whatismyip {
 
     def run_module(self):
         try:
-            cmd = ['py3status', '-c', self.config_path, '-o']
+            # -b routes notifications to notify-send instead of a nagbar,
+            # so a module's complaint on a headless compositor becomes a
+            # log line rather than a window over the display
+            cmd = ['py3status', '-c', self.config_path, '-o', '-b']
             exists = os.path.exists(self.config_path)
             readable = os.access(self.config_path, os.R_OK)
 
@@ -1141,6 +1161,13 @@ whatismyip {
                     result = bytes(result, "utf-8").decode("unicode_escape")
                 except Exception:
                     pass
+
+            # A module that failed renders as its own name, which is not
+            # data for anyone downstream
+            if result == self.module_name:
+                logging.warning(f"py3status ({self.module_name}): "
+                                "module failed, returning no data")
+                return None
 
             logging.info(f"py3status ({self.module_name}) parsed: {result}")
             return result
@@ -2098,7 +2125,10 @@ class Weather:
             texts.append(moon_line)
 
         uv_index = Weather.fetch_uv_index(location=self.location)
-        if uv_index:
+        risk = Weather.uv_risk(uv_index)
+        if risk:
+            texts.append(risk)
+        elif uv_index:
             texts.append(f"UV Index {uv_index}")
 
         return texts, icon
