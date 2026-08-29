@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import io
 import ipaddress
 import logging
@@ -96,6 +97,24 @@ class Art:
 
     def art_data(self):
         raise NotImplementedError
+
+    @staticmethod
+    def caption(meta):
+        '''
+        One line naming a work: title, artist and date, with the collection
+        appended when it is known
+        '''
+        if not isinstance(meta, dict):
+            return str(meta or "")
+
+        caption = ", ".join(p for p in (meta.get("title"),
+                                        meta.get("artist"),
+                                        meta.get("date")) if p)
+        source = meta.get("source", "")
+        if source:
+            caption = f"{caption} - {source}" if caption else source
+
+        return caption
 
 
 class ArtNGA(Art):
@@ -305,17 +324,142 @@ class ArtMet(Art):
 
 class Music:
 
+    spotify_token_url = "https://accounts.spotify.com/api/token"
+    spotify_playing_url = ("https://api.spotify.com/v1/me/player"
+                           "/currently-playing")
+
     def __init__(self):
         self.music = {'mpd_data'   : False,
                       'mpd_state'  : False,
                       'mpd_artist' : "",
                       'mpd_title'  : "",
                       'mpd_album'  : ""}
+        self.spotify_access_token = ""
+        self.spotify_token_expiry = 0
 
     def mpd(self):
         mpd = Py3status("mpd")
         data = mpd.run_module()
         return data
+
+    @staticmethod
+    def spotify_configured():
+        return bool(os.environ.get("SPOTIFY_CLIENT_ID")
+                    and os.environ.get("SPOTIFY_CLIENT_SECRET")
+                    and os.environ.get("SPOTIFY_REFRESH_TOKEN"))
+
+    def spotify_token(self):
+        '''
+        A valid access token, refreshed from SPOTIFY_REFRESH_TOKEN when the
+        cached one has expired. Empty when unconfigured or refused.
+        '''
+        if self.spotify_access_token and \
+           time.monotonic() < self.spotify_token_expiry:
+            return self.spotify_access_token
+
+        if not self.spotify_configured():
+            return ""
+
+        try:
+            response = requests.post(
+                self.spotify_token_url,
+                data={"grant_type": "refresh_token",
+                      "refresh_token":
+                          os.environ["SPOTIFY_REFRESH_TOKEN"]},
+                auth=(os.environ["SPOTIFY_CLIENT_ID"],
+                      os.environ["SPOTIFY_CLIENT_SECRET"]),
+                timeout=10)
+        except requests.RequestException as e:
+            logging.warning(f"spotify: token refresh failed: {e}")
+            return ""
+
+        if response.status_code != 200:
+            logging.warning("spotify: token refresh failed: "
+                            f"HTTP {response.status_code}")
+            return ""
+
+        data = response.json()
+        self.spotify_access_token = data.get("access_token", "")
+        self.spotify_token_expiry = time.monotonic() \
+            + data.get("expires_in", 3600) - 60
+
+        return self.spotify_access_token
+
+    @staticmethod
+    def spotify_art(url, save_dir=None):
+        '''
+        Downloads album art to a local file and returns its path, cached by
+        url so a track redrawn every few seconds is fetched once.
+        '''
+        if not url:
+            return ""
+
+        if save_dir is None:
+            save_dir = tempfile.gettempdir()
+        name = hashlib.md5(url.encode(encoding='UTF-8')).hexdigest()
+        path = os.path.join(save_dir, f"spotify-art-{name}.jpg")
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
+
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            with open(path, "wb") as f:
+                f.write(response.content)
+        except (requests.RequestException, OSError) as e:
+            logging.warning(f"spotify: album art fetch failed: {e}")
+            return ""
+
+        return path
+
+    def spotify(self):
+        '''
+        What the account is playing right now.
+        Returns None when unconfigured or on error, an empty dict when
+        nothing is playing, and otherwise the track: title, artists, album,
+        url, art_file, is_playing, progress_ms, duration_ms.
+        '''
+        token = self.spotify_token()
+        if not token:
+            return None
+
+        try:
+            response = requests.get(
+                self.spotify_playing_url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10)
+        except requests.RequestException as e:
+            logging.warning(f"spotify: currently-playing failed: {e}")
+            return None
+
+        # 204 is the authenticated answer for silence
+        if response.status_code == 204:
+            return {}
+        if response.status_code != 200:
+            logging.warning("spotify: currently-playing failed: "
+                            f"HTTP {response.status_code}")
+            return None
+
+        data = response.json()
+        item = data.get("item") or {}
+        if not item:
+            return {}
+
+        album = item.get("album") or {}
+        # The images come largest first; the smaller ones suit an overlay
+        images = album.get("images") or []
+        art_url = images[1].get("url", "") if len(images) > 1 \
+            else (images[0].get("url", "") if images else "")
+
+        return {"title": item.get("name", ""),
+                "artists": ", ".join(a.get("name", "")
+                                     for a in item.get("artists") or []),
+                "album": album.get("name", ""),
+                "url": (item.get("external_urls") or {}).get("spotify", ""),
+                "art_file": self.spotify_art(art_url),
+                "is_playing": data.get("is_playing", False),
+                "progress_ms": data.get("progress_ms") or 0,
+                "duration_ms": item.get("duration_ms") or 0}
 
 
 class Calendar:
@@ -368,6 +512,46 @@ class Calendar:
         except Exception as e:
             logging.error(f"Google Calendar fetch failed: {e}")
             return None
+
+    @staticmethod
+    def month_text(highlight=None, highlight_day_name=None):
+        '''
+        The current month as lines, with an empty line after the month name.
+        Today's day number and day name pass through the given callables
+        (each takes a re.Match), so a caller can mark them up for wherever
+        the lines end up
+        '''
+        import calendar
+        import datetime
+        import re
+
+        today = datetime.date.today()
+        lines = calendar.TextCalendar(calendar.MONDAY) \
+            .formatmonth(today.year, today.month).split('\n')
+        if len(lines) > 1:
+            lines = lines[:1] + [''] + lines[1:]
+
+        # The header row abbreviates day names to two letters, so the
+        # marker for today's name has to as well
+        day_str = str(today.day).rjust(2)
+        day_abbr = today.strftime("%a")[:2]
+        out = []
+        for line in lines:
+            if highlight:
+                line = re.sub(rf'(?<!\d){day_str}(?!\d)', highlight, line)
+            if highlight_day_name:
+                line = re.sub(rf'\b{day_abbr}\b', highlight_day_name, line)
+            out.append(line)
+
+        return out
+
+    @staticmethod
+    def holiday_lines(location="Germany", count=3):
+        '''The next bank holidays, one line each'''
+        holidays = Calendar.next_bank_holidays(location=location, count=count)
+
+        return [f"{h['date']}: {h['name']} ({h['localName']})"
+                for h in holidays or []]
 
     @staticmethod
     def next_bank_holidays(location="Germany", count=3):
@@ -811,8 +995,14 @@ class OTD:
         event = self.events.pop(0)
         self.events.append(event)
 
+        pages = event.get("pages") or []
+        url = (pages[0].get("content_urls", {})
+                       .get("desktop", {})
+                       .get("page", "")) if pages else ""
+
         return {"year": event.get("year"),
-                "text": event.get("text")}
+                "text": event.get("text"),
+                "url": url}
 
 
 class Py3status:
@@ -905,7 +1095,10 @@ whatismyip {
             stdout, stderr = p.communicate()
             logging.info(f"py3status ({self.module_name}):\n{stdout}")
 
-            if stderr:
+            if p.returncode != 0:
+                logging.warning(f"py3status ({self.module_name}) exited with "
+                                f"{p.returncode}: {(stderr or '').strip()}")
+            elif stderr:
                 logging.debug(f"py3status stderr ({self.module_name}): {stderr.strip()}")
 
             data = None
@@ -1049,6 +1242,54 @@ class System:
 
         return sys
 
+    @staticmethod
+    def net_addresses():
+        '''
+        The machine's own addresses by interface, without the loopback,
+        read from the kernel rather than from a shelled-out tool
+        '''
+        import array
+        import fcntl
+
+        lines = []
+
+        # IPv4 over SIOCGIFCONF: the kernel fills ifreq structs of name
+        # and address, 40 bytes each on 64 bit
+        try:
+            buffer = array.array('B', b'\0' * 4096)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                filled = struct.unpack(
+                    'iL', fcntl.ioctl(
+                        s.fileno(), 0x8912,
+                        struct.pack('iL', len(buffer),
+                                    buffer.buffer_info()[0])))[0]
+            data = buffer.tobytes()
+            for n in range(0, filled, 40):
+                name = data[n:n + 16].split(b'\0', 1)[0].decode()
+                address = socket.inet_ntoa(data[n + 20:n + 24])
+                if name != "lo" and not address.startswith("127."):
+                    lines.append(f"{name} {address}")
+        except (OSError, ValueError) as e:
+            logging.warning(f"net: Failed to list IPv4 addresses: {e}")
+
+        try:
+            with open('/proc/net/if_inet6', encoding='utf-8') as f:
+                for line in f:
+                    fields = line.split()
+                    if len(fields) < 6:
+                        continue
+                    address = socket.inet_ntop(socket.AF_INET6,
+                                               bytes.fromhex(fields[0]))
+                    name = fields[5]
+                    if name != "lo" and address != "::1":
+                        lines.append(f"{name} {address}")
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            logging.warning(f"net: Failed to list IPv6 addresses: {e}")
+
+        return "\n".join(lines)
+
     def net_data(probe_ip_address):
         net = {"address" : None,
                "addresses" : "",
@@ -1056,8 +1297,7 @@ class System:
                "online_status" : "",
                "resolvconf" : ""}
         net["address"] = System.net_iface_address(probe_ip_address)
-        net_iplist = Py3status("net_iplist")
-        net["addresses"] = net_iplist.run_module()
+        net["addresses"] = System.net_addresses()
         whatismyip = Py3status("whatismyip")
         net["public_ip"] = whatismyip.run_module()
         online_status = Py3status("online_status")
@@ -1804,6 +2044,64 @@ class Weather:
         if self.weather is None:
             return None, None
         return self.weather
+
+    moon_icons = {"New Moon": "\U0001F311",
+                  "Waxing Crescent": "\U0001F312",
+                  "First Quarter": "\U0001F313",
+                  "Waxing Gibbous": "\U0001F314",
+                  "Full Moon": "\U0001F315",
+                  "Waning Gibbous": "\U0001F316",
+                  "Last Quarter": "\U0001F317",
+                  "Waning Crescent": "\U0001F318"}
+
+    def report(self):
+        '''
+        The lines a weather view shows: temperature, conditions and wind,
+        the area, sun and moon, and the uv index, plus the icon file
+        '''
+        texts = []
+        data, icon = self.current_weather()
+
+        if icon:
+            texts.append(icon)
+
+        if not data:
+            texts.append("Weather data unavailable")
+        else:
+            try:
+                current = data["current_condition"][0]
+                texts.append(current["temp_C"] + "°C")
+                texts.append(current["weatherDesc"][0]["value"]
+                             + " " + current["windspeedKmph"] + " km/h")
+                texts.append(data["nearest_area"][0]["areaName"][0]["value"])
+                texts.append("")
+            except (KeyError, IndexError, TypeError) as e:
+                logging.error(f"weather: Unexpected data format: {e}")
+                texts.append("Weather data unavailable")
+
+        sun = Calendar.sunrise_sunset(location=self.location)
+        today = (sun or {}).get("today", {})
+        if today.get("sunrise") and today.get("sunset"):
+            texts.append(f"Sunrise {today['sunrise']}  "
+                         f"Sunset {today['sunset']}")
+        else:
+            logging.info("weather: No sunrise/sunset data for "
+                         f"{self.location}: {sun}")
+
+        moon_phase, moon_icon, days_until_full = \
+            Calendar.moonphase(location=self.location)
+        if moon_phase:
+            moon_char = self.moon_icons.get(moon_phase, "\U0001F319")
+            moon_line = f"{moon_char} Moon {moon_phase}"
+            if days_until_full is not None:
+                moon_line += f" ({days_until_full} days to full)"
+            texts.append(moon_line)
+
+        uv_index = Weather.fetch_uv_index(location=self.location)
+        if uv_index:
+            texts.append(f"UV Index {uv_index}")
+
+        return texts, icon
 
     @staticmethod
     def fetch_uv_index(location="Berlin"):
