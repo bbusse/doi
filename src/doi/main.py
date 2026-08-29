@@ -5,15 +5,16 @@ import json
 import os
 import platform
 import random
+import select
 import socket
 import sqlite3
+import struct
 import subprocess
 import threading
 import time
 import tempfile
 import xml.etree.ElementTree as ET
 import requests
-from hnapi import HnApi
 from paho.mqtt import client as mqtt_client
 
 
@@ -641,21 +642,6 @@ class News:
         random.shuffle(self.news)
         logging.info(f"RSS: Fetched {len(self.news)} items from {url}")
 
-    def hn_fetch_top_news(self, nitems):
-        n = 0
-
-        logging.info("Fetching News")
-        con = HnApi()
-        top = con.get_top()
-
-        for tnews in top:
-            if n == nitems:
-                break
-
-            self.news.append(con.get_item(tnews))
-            n += 1
-
-
 class RSSFeed:
     ATOM_NS = "http://www.w3.org/2005/Atom"
 
@@ -743,15 +729,16 @@ class OTD:
             logging.error(f"Failed to fetch otd data: {e}")
 
     def otd_item(self):
-        n = {"year": "",
-             "text": ""}
-
         if not self.events:
             return None
 
-        n["year"] = self.events[0].get('year')
-        n["text"] = self.events[0].get('text')
-        return n
+        # Rotate, so repeated calls cycle through the day's events
+        # instead of showing the first one for ever
+        event = self.events.pop(0)
+        self.events.append(event)
+
+        return {"year": event.get("year"),
+                "text": event.get("text")}
 
 
 class Py3status:
@@ -1040,6 +1027,8 @@ class System:
             fields = data[end + 2:].split()
             try:
                 cpu_s = (int(fields[11]) + int(fields[12])) / ticks
+                threads = int(fields[17])
+                starttime = int(fields[19])
                 rss_b = int(fields[21]) * page_size
             except (IndexError, ValueError, ZeroDivisionError):
                 continue
@@ -1047,20 +1036,27 @@ class System:
             procs.append({"pid": int(entry),
                           "name": data[start + 1:end],
                           "cpu_s": cpu_s,
+                          "threads": threads,
+                          "starttime": starttime,
                           "rss_b": rss_b})
 
         return procs
 
     @staticmethod
     def mem_data():
+        wanted = {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}
         fields = {}
         try:
             with open("/proc/meminfo", encoding="utf-8") as f:
                 for line in f:
                     name, _, rest = line.partition(":")
+                    if name not in wanted:
+                        continue
                     value = rest.split()
                     if value:
                         fields[name] = int(value[0]) * 1024
+                    if len(fields) == len(wanted):
+                        break
         except (OSError, ValueError):
             return ""
 
@@ -1083,17 +1079,45 @@ class System:
 
         return text
 
-    @staticmethod
-    def human_bytes(count):
-        for unit in ("B", "K", "M", "G"):
-            if count < 1024 or unit == "G":
-                return f"{count:.0f}{unit}" if unit == "B" else f"{count:.1f}{unit}"
-            count /= 1024
-
     # One walk answers both the biggest files and the biggest directories, so
     # the two views share it rather than each paying for a traversal
     _sizes_cache = {}
     _sizes_lock = threading.Lock()
+
+    @staticmethod
+    def host_uptime_seconds():
+        """
+        Seconds since the host booted, or None where /proc/uptime is absent.
+
+        In a container this is the uptime of the kernel the container runs on,
+        which is the host or the vm hosting it, not the container's own.
+        """
+        try:
+            with open("/proc/uptime", encoding="utf-8") as f:
+                return float(f.read().split()[0])
+        except (OSError, ValueError, IndexError) as e:
+            logging.debug(f"uptime: Cannot read /proc/uptime: {e}")
+
+            return None
+
+    @staticmethod
+    def host_uptime():
+        """ Host uptime as a short human string, e.g. '3d 4h 12m' """
+        seconds = System.host_uptime_seconds()
+        if seconds is None:
+            return "unknown"
+
+        days, rest = divmod(int(seconds), 86400)
+        hours, rest = divmod(rest, 3600)
+        minutes = rest // 60
+        parts = []
+        if days:
+            parts.append(f"{days}d")
+        if days or hours:
+            parts.append(f"{hours}h")
+        parts.append(f"{minutes}m")
+
+        return " ".join(parts)
 
     @staticmethod
     def human_bytes(n):
@@ -1200,6 +1224,161 @@ class System:
             lines.append(f"{System.human_bytes(size):>9}  {name}")
         if scan["truncated"]:
             lines.append("... scan stopped early, results are partial")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def icmp_checksum(data):
+        if len(data) % 2:
+            data += b"\x00"
+
+        total = 0
+        for i in range(0, len(data), 2):
+            total += (data[i] << 8) + data[i + 1]
+        while total >> 16:
+            total = (total & 0xffff) + (total >> 16)
+
+        return ~total & 0xffff
+
+    @staticmethod
+    def icmp_echo(ident, seq):
+        header = struct.pack("!BBHHH", 8, 0, 0, ident, seq)
+        payload = b"iss-display"
+        checksum = System.icmp_checksum(header + payload)
+
+        return struct.pack("!BBHHH", 8, 0, checksum, ident, seq) + payload
+
+    @staticmethod
+    def icmp_reply(packet, ident, seq):
+        ihl = (packet[0] & 0x0f) * 4
+        icmp = packet[ihl:]
+        if len(icmp) < 8:
+            return None
+
+        kind, _, _, got_id, got_seq = struct.unpack("!BBHHH", icmp[:8])
+        if kind == 0:
+            return "reached" if (got_id, got_seq) == (ident, seq) else None
+
+        if kind not in (3, 11) or len(icmp) < 16:
+            return None
+
+        inner = icmp[8:]
+        inner_icmp = inner[(inner[0] & 0x0f) * 4:]
+        if len(inner_icmp) < 8:
+            return None
+
+        got_id, got_seq = struct.unpack("!HH", inner_icmp[4:8])
+        if (got_id, got_seq) != (ident, seq):
+            return None
+
+        return "unreachable" if kind == 3 else "hop"
+
+    @staticmethod
+    def traceroute_probe(sock, dest, ttl, ident, seq, wait_s):
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
+        sent = time.monotonic()
+        try:
+            sock.sendto(System.icmp_echo(ident, seq), (dest, 0))
+        except OSError as e:
+            logging.warning(f"traceroute: send to {dest} failed: {e}")
+            return None, None, None
+
+        deadline = sent + wait_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None, None, None
+
+            if not select.select([sock], [], [], remaining)[0]:
+                return None, None, None
+
+            packet, addr = sock.recvfrom(1024)
+            kind = System.icmp_reply(packet, ident, seq)
+            if kind:
+                return addr[0], (time.monotonic() - sent) * 1000, kind
+
+    @staticmethod
+    def traceroute(target, max_hops=20, wait_s=1, cycles=5, timeout_s=120):
+        if not target:
+            return "No traceroute target"
+
+        try:
+            dest = socket.gethostbyname(target)
+        except OSError as e:
+            logging.warning(f"traceroute: cannot resolve {target}: {e}")
+            return f"Cannot resolve {target}"
+
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
+                                 socket.IPPROTO_ICMP)
+        except PermissionError:
+            logging.warning("traceroute: raw sockets need CAP_NET_RAW")
+            return "Traceroute needs CAP_NET_RAW"
+        except OSError as e:
+            logging.warning(f"traceroute: cannot open a raw socket: {e}")
+            return "Traceroute cannot open a raw socket"
+
+        ident = os.getpid() & 0xffff
+        deadline = time.monotonic() + timeout_s
+        hops = {}
+        last_ttl = max_hops
+        stopped = False
+
+        with sock:
+            for cycle in range(cycles):
+                ttl = 1
+                while ttl <= last_ttl:
+                    if time.monotonic() > deadline:
+                        stopped = True
+                        break
+
+                    hop = hops.setdefault(ttl, {"hosts": [], "sent": 0,
+                                                "times": []})
+                    hop["sent"] += 1
+                    host, rtt, kind = System.traceroute_probe(
+                        sock, dest, ttl, ident, (cycle * 256 + ttl) & 0xffff,
+                        wait_s)
+                    if host is not None:
+                        if host not in hop["hosts"]:
+                            hop["hosts"].append(host)
+                        hop["times"].append(rtt)
+                        if kind == "reached":
+                            last_ttl = ttl
+                    ttl += 1
+
+                if stopped:
+                    break
+
+        if not hops:
+            return f"No reply from any hop towards {dest}"
+
+        shown = dest if dest == target else f"{target} ({dest})"
+        lines = [f"Trace to {shown}, {cycles} cycles\n",
+                 f"{'HOP':>3}  {'HOST':<22} {'LOSS%':>6} {'SNT':>4}"
+                 f" {'LAST':>7} {'AVG':>7} {'BEST':>7} {'WRST':>7}"]
+
+        for ttl in range(1, max(hops) + 1):
+            hop = hops.get(ttl)
+            if hop is None:
+                continue
+
+            host = hop["hosts"][0] if hop["hosts"] else "???"
+            if len(hop["hosts"]) > 1:
+                host += f" +{len(hop['hosts']) - 1}"
+
+            times = hop["times"]
+            loss = 100.0 * (hop["sent"] - len(times)) / hop["sent"]
+            if times:
+                stats = (f" {times[-1]:>7.1f} {sum(times) / len(times):>7.1f}"
+                         f" {min(times):>7.1f} {max(times):>7.1f}")
+            else:
+                stats = f" {'-':>7} {'-':>7} {'-':>7} {'-':>7}"
+
+            lines.append(f"{ttl:>3}  {host:<22} {loss:>5.1f}%"
+                         f" {hop['sent']:>4}{stats}")
+
+        if stopped:
+            lines.append(f"... stopped after {timeout_s}s")
 
         return "\n".join(lines)
 
@@ -1375,9 +1554,9 @@ class System:
 
     def _uptime_from_proc():
         result = {"uptime": "", "users": "", "load": ""}
-        try:
-            with open('/proc/uptime', encoding='utf-8') as f:
-                seconds = int(float(f.read().split()[0]))
+        seconds = System.host_uptime_seconds()
+        if seconds is not None:
+            seconds = int(seconds)
             days, seconds = divmod(seconds, 86400)
             hours, seconds = divmod(seconds, 3600)
             minutes = seconds // 60
@@ -1386,8 +1565,6 @@ class System:
                 parts.append(f"{days} day{'s' if days != 1 else ''}")
             parts.append(f"{hours}:{minutes:02d}")
             result["uptime"] = ", ".join(parts)
-        except Exception as e:
-            logging.error(f"Failed reading /proc/uptime: {e}")
 
         try:
             with open('/proc/loadavg', encoding='utf-8') as f:
