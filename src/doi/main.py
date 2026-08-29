@@ -15,6 +15,8 @@ import threading
 import time
 import tempfile
 import xml.etree.ElementTree as ET
+
+__version__ = "0.1.0"
 import requests
 from paho.mqtt import client as mqtt_client
 
@@ -775,6 +777,10 @@ class RSSFeed:
 
 class OTD:
 
+    # Wikimedia returns 403 to the default requests user agent and asks for a
+    # descriptive one naming the project, see https://w.wiki/4wJS
+    user_agent = f"doi/{__version__} (https://github.com/bbusse/doi)"
+
     def __init__(self, sources):
         import datetime
         today = datetime.date.today()
@@ -784,7 +790,8 @@ class OTD:
         self.events = []
 
         try:
-            response = requests.get(url, timeout=10)
+            response = requests.get(url, timeout=10,
+                                    headers={"User-Agent": self.user_agent})
             if response.status_code == 200:
                 data = response.json()
                 for event in data.get("events", []):

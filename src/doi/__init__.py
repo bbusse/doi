@@ -1,8 +1,7 @@
 # doi package
 
-__version__ = "0.1.0"
-
 from doi.main import (
+    __version__,
     APOD,
     Art,
     ArtMet,
