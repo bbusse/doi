@@ -1,4 +1,5 @@
 import csv
+import io
 import ipaddress
 import logging
 import json
@@ -117,6 +118,7 @@ class ArtNGA(Art):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._size = None
+        self._objects_size = None
 
     def csv_size(self):
         if self._size is None:
@@ -144,9 +146,70 @@ class ArtNGA(Art):
             if not fields[0] or "-" not in fields[0]:
                 continue
 
-            return {"uuid": fields[0], "text": fields[12]}
+            return {"uuid": fields[0],
+                    "objectid": fields[11],
+                    "text": fields[12]}
 
         return None
+
+    objects_csv = ("https://raw.githubusercontent.com/NationalGalleryOfArt/"
+                   "opendata/main/data/objects.csv")
+    object_fields = 31
+    max_probes = 30
+
+    def objects_size(self):
+        if self._objects_size is None:
+            r = requests.head(self.objects_csv, timeout=10,
+                              allow_redirects=True, headers=self.plain)
+            r.raise_for_status()
+            self._objects_size = int(r.headers["content-length"])
+
+        return self._objects_size
+
+    def object_row(self, text):
+        lines = text.splitlines()[1:]
+        for i, line in enumerate(lines):
+            head = next(csv.reader([line]), [])
+            if not head or not head[0].isdigit():
+                continue
+            for row in csv.reader(io.StringIO("\n".join(lines[i:]))):
+                if len(row) >= self.object_fields and row[0].isdigit():
+                    return row
+                break
+
+        return None
+
+    def object_meta(self, objectid):
+        try:
+            wanted = int(objectid)
+        except (TypeError, ValueError):
+            return {}
+
+        lo, hi, probes = 0, self.objects_size(), 0
+        while lo < hi and probes < self.max_probes:
+            mid = (lo + hi) // 2
+            probes += 1
+            headers = dict(self.plain)
+            headers["Range"] = f"bytes={mid}-{mid + self.window}"
+            r = requests.get(self.objects_csv, timeout=15, headers=headers)
+            r.raise_for_status()
+            row = self.object_row(r.text)
+            if row is None:
+                lo = mid + self.window
+                continue
+
+            found = int(row[0])
+            if found == wanted:
+                return {"title": row[5], "date": row[6],
+                        "medium": row[10], "artist": row[15]}
+            if found < wanted:
+                lo = mid + 1
+            else:
+                hi = mid
+
+        logging.info(f"Art: No metadata for object {objectid} in {probes} reads")
+
+        return {}
 
     def art_data(self):
         try:
@@ -159,8 +222,11 @@ class ArtNGA(Art):
             url = self.iiif.format(uuid=row["uuid"], width=self.width,
                                    height=self.height)
             path = self.save_image(url, "art-nga.jpg")
+            meta = self.object_meta(row["objectid"])
+            meta["description"] = row["text"] or ""
+            meta["source"] = "National Gallery of Art"
 
-            return path, (row["text"] or "National Gallery of Art")
+            return path, meta
         except Exception as e:
             logging.error(f"Art: Error fetching from the National Gallery: {e}")
 
@@ -211,7 +277,9 @@ class ArtMet(Art):
                 return {"image": image,
                         "title": data.get("title") or "",
                         "artist": data.get("artistDisplayName") or "",
-                        "date": data.get("objectDate") or ""}
+                        "date": data.get("objectDate") or "",
+                        "medium": data.get("medium") or "",
+                        "description": data.get("creditLine") or ""}
 
         return None
 
@@ -224,10 +292,9 @@ class ArtMet(Art):
                 return None, None
 
             path = self.save_image(work["image"], "art-met.jpg")
-            caption = ", ".join(p for p in (work["title"], work["artist"],
-                                            work["date"]) if p)
+            work["source"] = "The Metropolitan Museum of Art"
 
-            return path, (caption or "The Metropolitan Museum of Art")
+            return path, work
         except Exception as e:
             logging.error(f"Art: Error fetching from the Met: {e}")
 
@@ -1437,8 +1504,101 @@ class System:
         return f"[{System.net_hex_address(address)}]:{port}" \
             if len(address) == 32 else f"{System.net_hex_address(address)}:{port}"
 
+    netlink_sock_diag = 4
+    sock_diag_by_family = 20
+    inet_diag_info = 2
+    # Offsets into struct tcp_info, checked against ss -ti
+    tcpi_bytes_received = 128
+    tcpi_bytes_sent = 200
+
+    @staticmethod
+    def tcp_diag_request(family):
+        # struct inet_diag_req_v2, then an empty inet_diag_sockid
+        req = struct.pack("=BBBBI", family, socket.IPPROTO_TCP,
+                          1 << (System.inet_diag_info - 1), 0, 0xfff)
+        req += b"\0" * 48
+
+        return struct.pack("=IHHII", 16 + len(req), System.sock_diag_by_family,
+                           0x301, 1, os.getpid()) + req
+
+    @staticmethod
+    def tcp_diag_row(body, family):
+        if len(body) < 72:
+            return None
+
+        sport, dport = struct.unpack("!HH", body[4:8])
+        local = System.net_diag_endpoint(body[8:24], sport, family)
+        remote = System.net_diag_endpoint(body[24:40], dport, family)
+        sent = received = None
+        off = 72
+        while off + 4 <= len(body):
+            alen, atype = struct.unpack("=HH", body[off:off + 4])
+            if alen < 4:
+                break
+            data = body[off + 4:off + alen]
+            if (atype == System.inet_diag_info
+                    and len(data) >= System.tcpi_bytes_sent + 8):
+                received = struct.unpack_from("=Q", data,
+                                              System.tcpi_bytes_received)[0]
+                sent = struct.unpack_from("=Q", data,
+                                          System.tcpi_bytes_sent)[0]
+            off += (alen + 3) & ~3
+
+        return (local, remote), sent, received
+
+    @staticmethod
+    def net_diag_endpoint(raw, port, family):
+        if family == socket.AF_INET:
+            return f"{socket.inet_ntop(family, raw[:4])}:{port}"
+
+        return f"[{socket.inet_ntop(family, raw[:16])}]:{port}"
+
+    @staticmethod
+    def tcp_byte_counts():
+        """
+        Bytes sent and received per tcp socket, from tcp_info over netlink.
+
+        /proc/net/tcp carries queue depths, not totals, so the counters have
+        to come from sock_diag. Anything that goes wrong here leaves the
+        table without the columns rather than without the sockets.
+        """
+        counts = {}
+        for family in (socket.AF_INET, socket.AF_INET6):
+            try:
+                s = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM,
+                                  System.netlink_sock_diag)
+            except OSError as e:
+                logging.info(f"sockets: No netlink sock_diag: {e}")
+
+                return counts
+
+            try:
+                with s:
+                    s.settimeout(2)
+                    s.send(System.tcp_diag_request(family))
+                    while True:
+                        buf = s.recv(65536)
+                        off, done = 0, False
+                        while off + 16 <= len(buf):
+                            length, mtype = struct.unpack("=IH", buf[off:off + 6])
+                            if length < 16 or mtype in (2, 3):
+                                done = True
+                                break
+                            row = System.tcp_diag_row(
+                                buf[off + 16:off + length], family)
+                            if row and row[1] is not None:
+                                counts[row[0]] = (row[1], row[2])
+                            off += (length + 3) & ~3
+                        if done:
+                            break
+            except (OSError, socket.timeout, struct.error) as e:
+                logging.info(f"sockets: sock_diag dump failed: {e}")
+
+        return counts
+
     @staticmethod
     def net_socket_list():
+        counts = System.tcp_byte_counts()
         sockets = []
         for proto, path in (("tcp", "/proc/net/tcp"), ("tcp", "/proc/net/tcp6"),
                             ("udp", "/proc/net/udp"), ("udp", "/proc/net/udp6")):
@@ -1455,10 +1615,14 @@ class System:
                             state = "UNCONN" if remote.endswith(":0") else "ESTABLISHED"
                         else:
                             state = System.tcp_states.get(fields[3].upper(), fields[3])
+                        sent, received = counts.get((local, remote),
+                                                   (None, None))
                         sockets.append({"proto": proto,
                                         "local": local,
                                         "remote": remote,
-                                        "state": state})
+                                        "state": state,
+                                        "sent": sent,
+                                        "received": received})
             except FileNotFoundError:
                 continue
             except Exception as e:
@@ -1477,8 +1641,15 @@ class System:
                                     s["proto"], s["local"]))
         shown = sockets[:limit] if limit else sockets
 
-        lines = [f"{s['proto']:<4} {s['local']:<26} {s['remote']:<26} {s['state']}"
-                 for s in shown]
+        lines = [f"{'PROTO':<4} {'LOCAL':<24} {'REMOTE':<24}"
+                 f" {'STATE':<11} {'SENT':>8} {'RECV':>8}"]
+        for s in shown:
+            sent = System.human_bytes(s["sent"]) if s.get("sent") is not None else "-"
+            received = (System.human_bytes(s["received"])
+                        if s.get("received") is not None else "-")
+            lines.append(f"{s['proto']:<4} {s['local'][:24]:<24}"
+                         f" {s['remote'][:24]:<24} {s['state']:<11}"
+                         f" {sent:>8} {received:>8}")
         if limit and len(sockets) > limit:
             lines.append(f"... {len(sockets) - limit} more of {len(sockets)}")
 
