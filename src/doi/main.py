@@ -298,7 +298,7 @@ class ArtMet(Art):
             if r.status_code != 200:
                 continue
             data = r.json()
-            # web-large is plenty for a display and a fraction of the original
+            # web-large is a fraction of the original and still generously sized
             image = data.get("primaryImageSmall") or data.get("primaryImage")
             if image:
                 return {"image": image,
@@ -395,7 +395,7 @@ class Music:
     def spotify_art(url, save_dir=None):
         '''
         Downloads album art to a local file and returns its path, cached by
-        url so a track redrawn every few seconds is fetched once.
+        url, so a track asked for again every few seconds is fetched once.
         '''
         if not url:
             return ""
@@ -452,7 +452,8 @@ class Music:
             return {}
 
         album = item.get("album") or {}
-        # The images come largest first; the smaller ones suit an overlay
+        # The images come largest first; the mid size balances detail
+        # against transfer
         images = album.get("images") or []
         art_url = images[1].get("url", "") if len(images) > 1 \
             else (images[0].get("url", "") if images else "")
@@ -975,9 +976,10 @@ class OTD:
         self.events = []
         self.fetched_on = None
 
-    # Lazy and dated, so building a playlist never blocks on the network and
-    # the view follows the calendar instead of the day the process started.
-    # A failed refetch keeps the previous day's events rather than nothing
+    # Lazy and dated, so constructing this never blocks on the network and
+    # callers get the current day's events rather than those of the day
+    # the process started. A failed refetch keeps the previous day's
+    # events rather than nothing
     def fetch(self):
         import datetime
         today = datetime.date.today()
@@ -1084,8 +1086,8 @@ whatismyip {
     def run_module(self):
         try:
             # -b routes notifications to notify-send instead of a nagbar,
-            # so a module's complaint on a headless compositor becomes a
-            # log line rather than a window over the display
+            # so a failing module ends up in the log instead of spawning
+            # a nagbar process
             cmd = ['py3status', '-c', self.config_path, '-o', '-b']
             exists = os.path.exists(self.config_path)
             readable = os.access(self.config_path, os.R_OK)
@@ -1186,6 +1188,17 @@ whatismyip {
         return tmp.name
 
 
+# ps and uptime are absent from some minimal images by design, and the /proc
+# fallbacks are complete, so a missing tool is a permanent state not an error
+_missing_tools_seen = set()
+
+
+def _note_missing_tool(tool):
+    if tool not in _missing_tools_seen:
+        _missing_tools_seen.add(tool)
+        logging.debug("%s not found, reading /proc directly", tool)
+
+
 class System:
 
     def list_processes(limit=0):
@@ -1207,7 +1220,7 @@ class System:
                 encoding="utf8"
             ).communicate()[0]
         except FileNotFoundError:
-            logging.warning("ps not found, falling back to /proc")
+            _note_missing_tool("ps")
             ps = System._processes_from_proc()
         except Exception as e:
             logging.error(f"ps failed: {e}")
@@ -1420,8 +1433,8 @@ class System:
 
         return text
 
-    # One walk answers both the biggest files and the biggest directories, so
-    # the two views share it rather than each paying for a traversal
+    # One walk answers both the biggest files and the biggest directories,
+    # so both callers share it rather than each paying for a traversal
     _sizes_cache = {}
     _sizes_lock = threading.Lock()
 
@@ -1732,10 +1745,11 @@ class System:
         procs.sort(key=lambda p: p["cpu_s"], reverse=True)
         shown = procs[:limit] if limit else procs
 
-        lines = [f"{'PID':>7}  {'CPU TIME':>10}  {'MEM':>7}  COMMAND"]
+        lines = [f"{'PID':>7}  {'CPU TIME':>12}  {'MEM':>7}  COMMAND"]
         for proc in shown:
             minutes, seconds = divmod(proc["cpu_s"], 60)
-            lines.append(f"{proc['pid']:>7}  {int(minutes):>6}m{seconds:04.1f}s"
+            cpu_time = f"{int(minutes)}m{seconds:04.1f}s"
+            lines.append(f"{proc['pid']:>7}  {cpu_time:>12}"
                          f"  {System.human_bytes(proc['rss_b']):>7}"
                          f"  {proc['name']}")
         if limit and len(procs) > limit:
@@ -1930,6 +1944,9 @@ class System:
         return "\n".join(lines)
 
     def net_valid_ip_address(ip_address):
+        # An unset target is expected and not an error
+        if not ip_address:
+            return False
         try:
             ipaddress.ip_address(ip_address)
             return True
@@ -1937,25 +1954,31 @@ class System:
             logging.warning(f"{ip_address} is an invalid IP address")
             return False
 
-    def net_iface_address(ip_address):
+    def net_iface_address(target):
+        # target is an IP or a hostname. The local address facing it is the
+        # source address the kernel assigns to a UDP socket connected toward
+        # it. getaddrinfo resolves the name and settles the family. Nothing
+        # is sent
+        if not target:
+            return ""
         try:
-            ip_obj = ipaddress.ip_address(ip_address)
-        except ValueError:
-            logging.warning(f"{ip_address} is an invalid IP address")
+            family, _, _, _, sockaddr = socket.getaddrinfo(
+                target, 80, type=socket.SOCK_DGRAM)[0]
+        except socket.gaierror as e:
+            logging.warning(f"net: cannot resolve probe target {target!r}: {e}")
             return ""
 
-        family = socket.AF_INET6 if ip_obj.version == 6 else socket.AF_INET
         try:
             with socket.socket(family, socket.SOCK_DGRAM) as s:
                 s.settimeout(0.5)
                 try:
-                    s.connect((ip_address, 80))
+                    s.connect(sockaddr)
                 except OSError as e:
-                    logging.info(f"{ip_address} is unreachable or no route: {e}")
+                    logging.info(f"{target} is unreachable or no route: {e}")
                     return ""
                 return s.getsockname()[0]
         except Exception as e:
-            logging.error(f"Failed to determine local address for {ip_address}: {e}")
+            logging.error(f"Failed to determine local address for {target}: {e}")
             return ""
 
     @staticmethod
@@ -1970,7 +1993,7 @@ class System:
                              env=env)
             output, error = p.communicate()
         except FileNotFoundError:
-            logging.warning("uptime not found, falling back to /proc")
+            _note_missing_tool("uptime")
             return System._uptime_from_proc()
 
         # Example: ' 10:23:45 up 1 day,  2:34,  3 users,  load average: 0.00, 0.01, 0.05'
@@ -2083,8 +2106,8 @@ class Weather:
 
     def report(self):
         '''
-        The lines a weather view shows: temperature, conditions and wind,
-        the area, sun and moon, and the uv index, plus the icon file
+        The weather as lines: temperature, conditions and wind, the area,
+        sun and moon, and the uv index, plus the icon file
         '''
         texts = []
         data, icon = self.current_weather()
@@ -2167,6 +2190,10 @@ class Weather:
 
         for max_uv, label, adult, children in levels:
             if uv <= max_uv:
-                return f"UV {uv} ({label}) — Adults: {adult}. Children: {children}."
+                return (f"UV Index {uv} ({label})\n"
+                        f"Children: {children}\n"
+                        f"Adults: {adult}")
 
-        return f"UV {uv} (Extreme) — Adults: Avoid sun exposure. Children: Keep indoors during peak hours."
+        return (f"UV Index {uv} (Extreme)\n"
+                "Children: Keep indoors during peak hours\n"
+                "Adults: Avoid sun exposure")
