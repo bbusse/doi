@@ -64,3 +64,6 @@ coverage.xml
 
 # VS Code
 .vscode/
+
+/*.md
+!/README.md
