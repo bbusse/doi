@@ -21,11 +21,40 @@ __version__ = "0.1.0"
 import requests
 from paho.mqtt import client as mqtt_client
 
+USER_AGENT = f"doi/{__version__} (https://github.com/bbusse/doi)"
+
 
 def skip_comments(file):
     for line in file:
         if not line.strip().startswith('#'):
             yield line.strip()
+
+
+def cache_image(url, prefix, save_dir=None):
+    '''
+    Download an image to a local file keyed by url and return its path, so a
+    picture asked for repeatedly is fetched once. Empty string on no url or
+    a failed fetch
+    '''
+    if not url:
+        return ""
+
+    save_dir = save_dir or tempfile.gettempdir()
+    name = hashlib.md5(url.encode()).hexdigest()
+    path = os.path.join(save_dir, f"{prefix}{name}.jpg")
+    if os.path.isfile(path) and os.path.getsize(path) > 0:
+        return path
+
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        with open(path, "wb") as f:
+            f.write(resp.content)
+    except (requests.RequestException, OSError) as e:
+        logging.warning(f"cache_image: {url}: {e}")
+        return ""
+
+    return path
 
 
 class APOD:
@@ -42,34 +71,46 @@ class APOD:
             same shape the art sources return, so Art.caption formats it:
             title, artist (the credit), date, source and a description.
         """
-        apod_url = f"https://api.nasa.gov/planetary/apod?api_key={self.api_key}"
+        # thumbs=True asks the api for a poster frame on the days the picture
+        # is actually a video
+        apod_url = (f"https://api.nasa.gov/planetary/apod?api_key={self.api_key}"
+                    "&thumbs=True")
         try:
             resp = requests.get(apod_url, timeout=10)
             if resp.status_code != 200:
                 logging.error(f"APOD: Failed to fetch metadata: {resp.status_code}")
                 return None, None
             data = resp.json()
-            img_url = data.get("hdurl") or data.get("url")
-            if not img_url:
-                logging.error("APOD: No image URL found in response")
-                return None, None
-
-            # Download image
-            img_resp = requests.get(img_url, timeout=10)
-            if img_resp.status_code != 200:
-                logging.error(f"APOD: Failed to download image: {img_resp.status_code}")
-                return None, None
-
-            img_ext = os.path.splitext(img_url)[-1]
-            img_path = os.path.join(self.save_dir, f"apod{img_ext}")
-            with open(img_path, "wb") as f:
-                f.write(img_resp.content)
 
             meta = {"title": data.get("title", ""),
                     "artist": (data.get("copyright") or "").strip(),
                     "date": data.get("date", ""),
                     "source": "NASA APOD",
                     "description": data.get("explanation", "")}
+
+            if data.get("media_type", "image") == "image":
+                img_url = data.get("hdurl") or data.get("url")
+            else:
+                # video or other: the api's thumbnail if it gave one
+                img_url = data.get("thumbnail_url")
+            if not img_url:
+                logging.warning("APOD: no image today "
+                                f"(media_type={data.get('media_type')})")
+                return None, meta
+
+            img_resp = requests.get(img_url, timeout=10)
+            if img_resp.status_code != 200:
+                logging.error(f"APOD: Failed to download image: {img_resp.status_code}")
+                return None, meta
+            content_type = img_resp.headers.get("Content-Type", "")
+            if content_type and not content_type.startswith("image/"):
+                logging.warning(f"APOD: {img_url} served {content_type}, skipping")
+                return None, meta
+
+            img_ext = os.path.splitext(img_url.split("?", 1)[0])[-1] or ".jpg"
+            img_path = os.path.join(self.save_dir, f"apod{img_ext}")
+            with open(img_path, "wb") as f:
+                f.write(img_resp.content)
 
             return img_path, meta
         except Exception as e:
@@ -391,33 +432,6 @@ class Music:
 
         return self.spotify_access_token
 
-    @staticmethod
-    def spotify_art(url, save_dir=None):
-        '''
-        Downloads album art to a local file and returns its path, cached by
-        url, so a track asked for again every few seconds is fetched once.
-        '''
-        if not url:
-            return ""
-
-        if save_dir is None:
-            save_dir = tempfile.gettempdir()
-        name = hashlib.md5(url.encode(encoding='UTF-8')).hexdigest()
-        path = os.path.join(save_dir, f"spotify-art-{name}.jpg")
-        if os.path.isfile(path) and os.path.getsize(path) > 0:
-            return path
-
-        try:
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            with open(path, "wb") as f:
-                f.write(response.content)
-        except (requests.RequestException, OSError) as e:
-            logging.warning(f"spotify: album art fetch failed: {e}")
-            return ""
-
-        return path
-
     def spotify(self):
         '''
         What the account is playing right now.
@@ -463,7 +477,7 @@ class Music:
                                      for a in item.get("artists") or []),
                 "album": album.get("name", ""),
                 "url": (item.get("external_urls") or {}).get("spotify", ""),
-                "art_file": self.spotify_art(art_url),
+                "art_file": cache_image(art_url, "spotify-art-"),
                 "is_playing": data.get("is_playing", False),
                 "progress_ms": data.get("progress_ms") or 0,
                 "duration_ms": item.get("duration_ms") or 0}
@@ -968,10 +982,6 @@ class RSSFeed:
 
 class OTD:
 
-    # Wikimedia returns 403 to the default requests user agent and asks for a
-    # descriptive one naming the project, see https://w.wiki/4wJS
-    user_agent = f"doi/{__version__} (https://github.com/bbusse/doi)"
-
     def __init__(self, sources):
         self.events = []
         self.fetched_on = None
@@ -990,7 +1000,7 @@ class OTD:
                f"{today.month}/{today.day}")
         try:
             response = requests.get(url, timeout=10,
-                                    headers={"User-Agent": self.user_agent})
+                                    headers={"User-Agent": USER_AGENT})
             if response.status_code == 200:
                 events = response.json().get("events", [])
                 if events:
@@ -1022,6 +1032,197 @@ class OTD:
         return {"year": event.get("year"),
                 "text": event.get("text"),
                 "url": url}
+
+
+class Bluesky:
+    '''
+    Recent posts from a public Bluesky account through the unauthenticated
+    AppView, so no token or login is needed
+
+    Each dict carries the feed / title / url keys the other news sources use
+    plus handle, text, created_at, link (an external url the post points to)
+    and, when the post has a picture, image (a local file path) with
+    image_url and image_alt
+    '''
+
+    api = "https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed"
+    # posts are refetched only once they are this stale, so a display can
+    # poll every few seconds
+    refetch_after_s = 600
+
+    def __init__(self, actor, limit=30, include_reposts=False, image_dir=None):
+        # actor is a handle, a did or a profile url
+        self.actor = actor.rstrip("/").split("/profile/")[-1]
+        self.limit = limit
+        self.include_reposts = include_reposts
+        self.image_dir = image_dir
+        self._items = []
+        self._fetched_at = None
+        self._lock = threading.Lock()
+
+    def item_count(self):
+        return len(self._items)
+
+    # Lazy so construction never blocks on the network, and a failed refetch
+    # keeps the posts already held
+    def fetch(self):
+        with self._lock:
+            if (self._items and self._fetched_at is not None
+                    and time.monotonic() - self._fetched_at
+                    < self.refetch_after_s):
+                return
+            self._parse()
+
+    def _parse(self):
+        params = {"actor": self.actor, "limit": self.limit,
+                  "filter": "posts_no_replies"}
+        try:
+            resp = requests.get(self.api, params=params, timeout=10,
+                                headers={"User-Agent": USER_AGENT})
+            resp.raise_for_status()
+            feed = resp.json().get("feed") or []
+        except Exception as e:
+            logging.error(f"bluesky: failed to fetch {self.actor}: {e}")
+            return
+
+        items = []
+        for entry in feed:
+            reason = (entry.get("reason") or {}).get("$type", "")
+            if reason.endswith("#reasonRepost") and not self.include_reposts:
+                continue
+
+            post = entry.get("post") or {}
+            record = post.get("record") or {}
+            text = (record.get("text") or "").strip()
+            if not text:
+                continue
+
+            author = post.get("author") or {}
+            handle = author.get("handle") or self.actor
+            rkey = (post.get("uri") or "").rsplit("/", 1)[-1]
+            link, image_url, image_alt = self._embed(post.get("embed") or {})
+            items.append({
+                "feed": author.get("displayName") or handle,
+                "handle": handle,
+                "title": text,
+                "text": text,
+                "url": f"https://bsky.app/profile/{handle}/post/{rkey}"
+                       if rkey else "",
+                "link": link,
+                "image_url": image_url,
+                "image_alt": image_alt,
+                "created_at": record.get("createdAt") or "",
+            })
+
+        if items:
+            for rank, item in enumerate(items, start=1):
+                item["rank"] = rank
+            self._items = items
+            self._fetched_at = time.monotonic()
+
+        logging.info(f"bluesky: fetched {len(items)} posts from {self.actor}")
+
+    @staticmethod
+    def _embed(view):
+        '''
+        The (link, image_url, image_alt) a post carries, read from the
+        hydrated embed view where getAuthorFeed puts the cdn urls
+        '''
+        kind = view.get("$type", "")
+
+        if kind == "app.bsky.embed.recordWithMedia#view":
+            return Bluesky._embed(view.get("media") or {})
+
+        if kind == "app.bsky.embed.images#view":
+            first = (view.get("images") or [{}])[0]
+            return ("", first.get("fullsize") or first.get("thumb") or "",
+                    first.get("alt") or "")
+
+        if kind == "app.bsky.embed.external#view":
+            ext = view.get("external") or {}
+            return (ext.get("uri") or "", ext.get("thumb") or "",
+                    ext.get("title") or "")
+
+        if kind == "app.bsky.embed.video#view":
+            return "", view.get("thumbnail") or "", ""
+
+        return "", "", ""
+
+    def post_item(self):
+        self.fetch()
+        if not self._items:
+            return None
+
+        # rotate so repeated calls cycle through the posts
+        item = self._items.pop(0)
+        self._items.append(item)
+        # picture resolved here, not during parse, so only shown posts fetch
+        item["image"] = cache_image(item.get("image_url", ""), "bsky-img-",
+                                    self.image_dir)
+        return item
+
+
+class PrometheusClient:
+    '''
+    Reads named samples from a Prometheus /metrics endpoint. Stateless: every
+    call fetches, so a view on a timer sees the current numbers
+    '''
+
+    def __init__(self, url, timeout=10):
+        self.url = url if "://" in url else "http://" + url
+        self.timeout = timeout
+
+    # (name, series, value) for every sample line, series being the name with
+    # any labels as the endpoint wrote them. The value is always after the
+    # last '}' (or the name), so a label value with spaces does not fool it
+    @staticmethod
+    def _parse(text):
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line[0] == "#":
+                continue
+            if "{" in line:
+                close = line.rfind("}")
+                if close < 0:
+                    continue
+                name = line[:line.index("{")]
+                series = line[:close + 1]
+                fields = line[close + 1:].split()
+            else:
+                fields = line.split()
+                name = series = fields.pop(0)
+            if not fields:
+                continue
+            try:
+                yield name, series, float(fields[0])
+            except ValueError:
+                continue
+
+    # {series: value} for the wanted metric names, e.g.
+    # 'iss_display_http_requests_total{path="/metrics"}'. No names asks for
+    # everything the endpoint exposes
+    def values(self, *names):
+        try:
+            resp = requests.get(self.url, timeout=self.timeout,
+                                headers={"User-Agent": USER_AGENT})
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            logging.error(f"prometheus: {self.url}: {e}")
+
+            return {}
+
+        wanted = set(names)
+
+        return {series: value
+                for name, series, value in self._parse(resp.text)
+                if not wanted or name in wanted}
+
+    # One number for a metric, summed over its label series the way a
+    # counter's total reads, or None when the endpoint has no such metric
+    def value(self, name):
+        series = self.values(name)
+
+        return sum(series.values()) if series else None
 
 
 class Py3status:
@@ -1069,8 +1270,8 @@ order = "online_status"
 order = "uptime"
 
 uptime {
-        format = 'up [\?if=weeks {weeks} weeks ][\?if=days {days} days ]
-        [\?if=hours {hours} hours ][\?if=minutes {minutes} minutes ]'
+    format = 'up [\?if=weeks {weeks} weeks ][\?if=days {days} days ]'
+    format += '[\?if=hours {hours} hours ][\?if=minutes {minutes} minutes ]'
 }
 """
         self.module_config["whatismyip"] = self.config_common + """
@@ -1173,6 +1374,17 @@ whatismyip {
 
             logging.info(f"py3status ({self.module_name}) parsed: {result}")
             return result
+        except FileNotFoundError:
+            # py3status is optional, so a missing binary means no data, like
+            # any other unreachable source
+            if "py3status" not in _missing_tools_seen:
+                _missing_tools_seen.add("py3status")
+                logging.warning("py3status is not installed, dependent "
+                                "modules return no data")
+            return None
+        except OSError as e:
+            logging.warning(f"py3status ({self.module_name}): {e}")
+            return None
         finally:
             try:
                 os.remove(self.config_path)
@@ -1924,8 +2136,14 @@ class System:
         if not sockets:
             return ""
 
-        order = {"LISTEN": 0, "UNCONN": 1}
-        sockets.sort(key=lambda s: (order.get(s["state"], 2),
+        # Listeners first, then live connections, then the closing and wait
+        # states last: a row of TIME_WAIT from loopback scrape churn should
+        # not push the sockets that matter off the top of the view
+        transient = {"TIME_WAIT", "CLOSE_WAIT", "FIN_WAIT1", "FIN_WAIT2",
+                     "CLOSING", "LAST_ACK", "CLOSE"}
+        order = {"LISTEN": 0, "ESTABLISHED": 1, "UNCONN": 2}
+        sockets.sort(key=lambda s: (4 if s["state"] in transient
+                                    else order.get(s["state"], 3),
                                     s["proto"], s["local"]))
         shown = sockets[:limit] if limit else sockets
 
