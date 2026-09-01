@@ -1,4 +1,5 @@
 import csv
+import glob
 import hashlib
 import io
 import ipaddress
@@ -30,24 +31,53 @@ def skip_comments(file):
             yield line.strip()
 
 
+# Content-Type first, then the magic bytes, so the cached file's extension
+# matches what a viewer will find inside it -- a webp saved as .jpg trips up
+# loaders that trust the name
+_IMAGE_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+              "image/webp": ".webp", "image/avif": ".avif",
+              "image/svg+xml": ".svg", "image/bmp": ".bmp",
+              "image/tiff": ".tiff"}
+
+
+def image_extension(content_type, content):
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if ct in _IMAGE_EXT:
+        return _IMAGE_EXT[ct]
+    if content[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if content[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return ".webp"
+    if content[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    head = content[:64].lstrip()
+    if head[:5] == b"<?xml" or head[:4] == b"<svg":
+        return ".svg"
+    return ".jpg"
+
+
 def cache_image(url, prefix, save_dir=None):
     '''
     Download an image to a local file keyed by url and return its path, so a
-    picture asked for repeatedly is fetched once. Empty string on no url or
-    a failed fetch
+    picture asked for repeatedly is fetched once. The extension follows the
+    response Content-Type. Empty string on no url or a failed fetch
     '''
     if not url:
         return ""
 
     save_dir = save_dir or tempfile.gettempdir()
     name = hashlib.md5(url.encode()).hexdigest()
-    path = os.path.join(save_dir, f"{prefix}{name}.jpg")
-    if os.path.isfile(path) and os.path.getsize(path) > 0:
-        return path
+    for path in glob.glob(os.path.join(save_dir, f"{prefix}{name}.*")):
+        if os.path.getsize(path) > 0:
+            return path
 
     try:
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
+        ext = image_extension(resp.headers.get("Content-Type"), resp.content)
+        path = os.path.join(save_dir, f"{prefix}{name}{ext}")
         with open(path, "wb") as f:
             f.write(resp.content)
     except (requests.RequestException, OSError) as e:
@@ -857,9 +887,6 @@ class News:
         return n
 
     def sqlite_select(self, db, query):
-        n = {"title": "",
-             "url": ""}
-
         if not os.path.exists(db):
             logging.error(f"News: Database does not exist {db}")
             return False
@@ -1148,6 +1175,15 @@ class Bluesky:
 
         return "", "", ""
 
+    # cdn.bsky.app negotiates to webp, which a Pillow built without libwebp
+    # cannot open, so the picture silently drops from the view. The @jpeg
+    # suffix pins the format the cdn returns
+    @staticmethod
+    def _pin_jpeg(url):
+        if url.startswith("https://cdn.bsky.app/img/") and "@" not in url:
+            return url + "@jpeg"
+        return url
+
     def post_item(self):
         self.fetch()
         if not self._items:
@@ -1157,8 +1193,8 @@ class Bluesky:
         item = self._items.pop(0)
         self._items.append(item)
         # picture resolved here, not during parse, so only shown posts fetch
-        item["image"] = cache_image(item.get("image_url", ""), "bsky-img-",
-                                    self.image_dir)
+        item["image"] = cache_image(self._pin_jpeg(item.get("image_url", "")),
+                                    "bsky-img-", self.image_dir)
         return item
 
 
@@ -2293,15 +2329,10 @@ class Weather:
         return data, icon
 
     def icon(self, condition):
-        icon = False
-
-        if "Sunny" == condition:
-            condition = "clear"
-        elif "Clear" == condition:
+        if condition in ("Sunny", "Clear"):
             condition = "clear"
 
         fn = f"themes/default/weather/{condition}.svg"
-
         if not os.path.exists(fn):
             return False
 
