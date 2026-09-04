@@ -2197,6 +2197,148 @@ class System:
 
         return "\n".join(lines)
 
+    # linux/neighbour.h: struct ndmsg is family/pad1 u8, pad2 u16,
+    # ifindex s32, state u16, flags u8, type u8
+    _NDA_DST = 1
+    _NDA_LLADDR = 2
+    _NUD = {0x01: "INCOMPLETE", 0x02: "REACHABLE", 0x04: "STALE",
+            0x08: "DELAY", 0x10: "PROBE", 0x20: "FAILED",
+            0x40: "NOARP", 0x80: "PERMANENT"}
+
+    @staticmethod
+    def _arp_from_proc():
+        # ipv4 only, no ndp, and the state is just complete or not, but it
+        # needs neither netlink nor a capability
+        rows = []
+        try:
+            with open("/proc/net/arp", encoding="utf-8") as f:
+                next(f, None)
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 6:
+                        continue
+                    ip, _, flags, mac, _, dev = parts[:6]
+                    rows.append({
+                        "ip": ip,
+                        "mac": "" if mac == "00:00:00:00:00:00" else mac,
+                        "dev": dev,
+                        "state": "REACHABLE" if flags == "0x2" else "INCOMPLETE",
+                    })
+        except OSError:
+            pass
+
+        return rows
+
+    @staticmethod
+    def _neigh_row(body, ifnames):
+        if len(body) < 12:
+            return None
+        fam, _, ifindex, state, _, _ = struct.unpack("=BxHiHBB", body[:12])
+        if fam not in (socket.AF_INET, socket.AF_INET6):
+            return None
+
+        ip = mac = ""
+        off = 12
+        while off + 4 <= len(body):
+            alen, atype = struct.unpack("=HH", body[off:off + 4])
+            if alen < 4:
+                break
+            val = body[off + 4:off + alen]
+            if atype == System._NDA_DST:
+                n = 16 if fam == socket.AF_INET6 else 4
+                try:
+                    ip = socket.inet_ntop(fam, val[:n])
+                except (OSError, ValueError):
+                    pass
+            elif atype == System._NDA_LLADDR and len(val) == 6:
+                mac = ":".join(f"{b:02x}" for b in val)
+            off += (alen + 3) & ~3
+
+        if not ip:
+            return None
+
+        return {"ip": ip, "mac": mac, "dev": ifnames.get(ifindex, str(ifindex)),
+                "state": System._NUD.get(state, str(state))}
+
+    @staticmethod
+    def net_neighbour_list():
+        """
+        The kernel neighbour table -- arp for ipv4, ndp for ipv6 -- read the
+        way `ip neigh show` reads it, over RTM_GETNEIGH on NETLINK_ROUTE,
+        since the image has no iproute2. Each entry: ip, mac, dev, state.
+        Falls back to /proc/net/arp (ipv4 only) when netlink is unavailable.
+        """
+        RTM_GETNEIGH, RTM_NEWNEIGH = 30, 28
+        try:
+            ifnames = dict(socket.if_nameindex())
+        except OSError:
+            ifnames = {}
+
+        try:
+            s = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, 0)
+        except (OSError, AttributeError) as e:
+            logging.info(f"neighbours: no netlink route: {e}")
+
+            return System._arp_from_proc()
+
+        entries = []
+        try:
+            with s:
+                s.settimeout(2)
+                ndmsg = struct.pack("=BxHiHBB", socket.AF_UNSPEC, 0, 0, 0, 0, 0)
+                s.send(struct.pack("=IHHII", 16 + len(ndmsg), RTM_GETNEIGH,
+                                   0x301, 1, os.getpid()) + ndmsg)
+                done = False
+                while not done:
+                    buf = s.recv(65536)
+                    off = 0
+                    while off + 16 <= len(buf):
+                        mlen, mtype = struct.unpack("=IH", buf[off:off + 6])
+                        if mlen < 16 or mtype in (2, 3):
+                            done = True
+                            break
+                        if mtype == RTM_NEWNEIGH:
+                            row = System._neigh_row(buf[off + 16:off + mlen],
+                                                    ifnames)
+                            if row:
+                                entries.append(row)
+                        off += (mlen + 3) & ~3
+        except (OSError, socket.timeout, struct.error) as e:
+            logging.info(f"neighbours: netlink dump failed: {e}")
+
+            return System._arp_from_proc()
+
+        return entries or System._arp_from_proc()
+
+    @staticmethod
+    def net_neighbours(limit=0):
+        rows = System.net_neighbour_list()
+        if not rows:
+            return ""
+
+        order = {"REACHABLE": 0, "PERMANENT": 0, "DELAY": 1, "PROBE": 1,
+                 "STALE": 2, "NOARP": 3, "FAILED": 4, "INCOMPLETE": 4}
+
+        def key(r):
+            try:
+                addr = ipaddress.ip_address(r["ip"])
+                ipk = (addr.version, int(addr))
+            except ValueError:
+                ipk = (9, 0)
+            return (order.get(r["state"], 3), r["dev"], ipk)
+
+        rows.sort(key=key)
+        shown = rows[:limit] if limit else rows
+
+        lines = [f"{'IP':<39} {'MAC':<17} {'DEV':<10} STATE"]
+        for r in shown:
+            lines.append(f"{r['ip']:<39} {r['mac'] or '-':<17}"
+                         f" {r['dev']:<10} {r['state']}")
+        if limit and len(rows) > limit:
+            lines.append(f"... {len(rows) - limit} more of {len(rows)}")
+
+        return "\n".join(lines)
+
     def net_valid_ip_address(ip_address):
         # An unset target is expected and not an error
         if not ip_address:
