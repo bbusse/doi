@@ -2536,7 +2536,11 @@ class Weather:
             moon_line = f"{moon_char} Moon {moon_phase}"
             if days_until_full is not None:
                 moon_line += f" ({days_until_full} days to full)"
+            # A blank line on each side sets the moon apart from the sun line
+            # above and the uv line below
+            texts.append("")
             texts.append(moon_line)
+            texts.append("")
 
         uv_index = Weather.fetch_uv_index(location=self.location)
         risk = Weather.uv_risk(uv_index)
