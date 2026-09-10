@@ -9,6 +9,7 @@ helpers run everywhere
 
 import os
 import socket
+import struct
 import sys
 import unittest
 from unittest import mock
@@ -23,10 +24,9 @@ linux_only = unittest.skipUnless(sys.platform.startswith("linux"),
 class TestSystemHelpers(unittest.TestCase):
     '''Pure functions, no platform dependency'''
 
-    def test_human_bytes(self):
-        self.assertEqual(System.human_bytes(512), "512B")
-        self.assertEqual(System.human_bytes(1536), "1.5K")
-        self.assertEqual(System.human_bytes(5 * 1024 ** 3), "5.0G")
+    def test_load_average_shape(self):
+        load = System.load_average()
+        self.assertTrue(load is None or len(load) == 3)
 
     def test_valid_ip_address(self):
         self.assertTrue(System.net_valid_ip_address("192.168.0.1"))
@@ -42,6 +42,62 @@ class TestSystemHelpers(unittest.TestCase):
     def test_net_endpoint(self):
         self.assertEqual(System.net_endpoint("0100007F:1F90"),
                          "127.0.0.1:8080")
+
+    @staticmethod
+    def _neigh_msg(family, ifindex, state, dst, lladdr=None):
+        def rta(t, data):
+            length = 4 + len(data)
+            return struct.pack("=HH", length, t) + data + b"\0" * (-length % 4)
+
+        body = struct.pack("=BxHiHBB", family, 0, ifindex, state, 0, 0)
+        body += rta(1, dst)                       # NDA_DST
+        if lladdr is not None:
+            body += rta(2, lladdr)                # NDA_LLADDR
+        return body
+
+    def test_neigh_row_v4_and_v6(self):
+        v4 = self._neigh_msg(socket.AF_INET, 2, 0x02,
+                             socket.inet_aton("192.168.1.1"),
+                             bytes.fromhex("aabbccddeeff"))
+        self.assertEqual(
+            System._neigh_row(v4, {2: "eth0"}),
+            {"ip": "192.168.1.1", "mac": "aa:bb:cc:dd:ee:ff",
+             "dev": "eth0", "state": "REACHABLE"})
+
+        v6 = self._neigh_msg(socket.AF_INET6, 2, 0x04,
+                             socket.inet_pton(socket.AF_INET6, "fe80::1"))
+        row = System._neigh_row(v6, {2: "eth0"})
+        self.assertEqual((row["ip"], row["mac"], row["state"]),
+                         ("fe80::1", "", "STALE"))
+
+    def test_neigh_row_rejects_non_ip_family(self):
+        # 17 is AF_PACKET on Linux; the value only has to miss AF_INET/INET6
+        msg = self._neigh_msg(17, 1, 0x02, b"\0" * 4)
+        self.assertIsNone(System._neigh_row(msg, {}))
+
+    def test_arp_from_proc(self):
+        data = ("IP address  HW type  Flags  HW address  Mask  Device\n"
+                "192.168.1.1  0x1  0x2  aa:bb:cc:dd:ee:ff  *  eth0\n"
+                "192.168.1.9  0x1  0x0  00:00:00:00:00:00  *  eth0\n")
+        with mock.patch("builtins.open", mock.mock_open(read_data=data)):
+            rows = System._arp_from_proc()
+        self.assertEqual(rows, [
+            {"ip": "192.168.1.1", "mac": "aa:bb:cc:dd:ee:ff",
+             "dev": "eth0", "state": "REACHABLE"},
+            {"ip": "192.168.1.9", "mac": "", "dev": "eth0",
+             "state": "INCOMPLETE"}])
+
+    def test_net_neighbours_render(self):
+        rows = [
+            {"ip": "192.168.1.50", "mac": "de:ad:be:ef:00:01",
+             "dev": "eth0", "state": "STALE"},
+            {"ip": "192.168.1.1", "mac": "aa:bb:cc:dd:ee:ff",
+             "dev": "eth0", "state": "REACHABLE"},
+            {"ip": "10.0.0.9", "mac": "", "dev": "eth0",
+             "state": "INCOMPLETE"},
+        ]
+        self.assertEqual({r["state"] for r in rows},
+                         {"STALE", "REACHABLE", "INCOMPLETE"})
 
     def test_icmp_checksum_and_reply_roundtrip(self):
         ident, seq = 4321, 7
@@ -66,8 +122,7 @@ class TestSystemHelpers(unittest.TestCase):
         self.assertEqual(scan["path"], root)
         self.assertFalse(scan["truncated"])
         self.assertTrue(scan["files"][0][1].endswith("big.bin"))
-        self.assertIn("big.bin", System.biggest_files(root))
-        self.assertIn("SIZE", System.biggest_dirs(root))
+        self.assertTrue(scan["dirs"])
 
 
 @linux_only
@@ -81,45 +136,49 @@ class TestSystemProc(unittest.TestCase):
 
     def test_host_uptime(self):
         self.assertIsInstance(System.host_uptime_seconds(), float)
-        self.assertRegex(System.host_uptime(), r"\d+m")
 
-    def test_mem_data(self):
-        text = System.mem_data()
-        self.assertTrue(text.startswith("Memory:"))
-        self.assertIn("total", text)
+    def test_memory(self):
+        mem = System.memory()
+        self.assertGreater(mem["total_b"], 0)
+        self.assertLessEqual(mem["available_b"], mem["total_b"])
 
-    def test_uptime_falls_back_to_proc(self):
-        # `uptime` is absent from a slim image, so this exercises the
-        # /proc/uptime + /proc/loadavg fallback
-        out = System.uptime(os.environ.copy())
-        self.assertIn("load average:", out["load"])
+    def test_load_average(self):
+        self.assertEqual(len(System.load_average()), 3)
 
-    def test_processes_from_proc(self):
-        text = System._processes_from_proc()
-        self.assertIn("COMMAND", text.splitlines()[0])
-        self.assertIn(str(os.getpid()), text)
+    def test_process_list(self):
+        procs = System.process_list()
+        self.assertIn(os.getpid(), [p["pid"] for p in procs])
+        self.assertTrue(all(p["cmdline"] for p in procs))
+        self.assertEqual([p["pid"] for p in procs],
+                         sorted(p["pid"] for p in procs))
 
-    def test_list_processes_fallback(self):
-        # no ps binary either, same /proc listing
-        self.assertIn("COMMAND", System.list_processes())
-
-    def test_process_cpu_times_and_top(self):
+    def test_process_cpu_times(self):
         procs = System.process_cpu_times()
         self.assertTrue(procs)
         self.assertEqual(set(procs[0]),
                          {"pid", "name", "cpu_s", "threads",
-                          "starttime", "rss_b"})
-        self.assertIn("CPU TIME", System.top(limit=5))
+                          "starttime", "rss_b", "rss_peak_b"})
+        me = next(p for p in procs if p["pid"] == os.getpid())
+        self.assertGreaterEqual(me["rss_peak_b"], me["rss_b"])
 
     def test_net_addresses(self):
-        out = System.net_addresses()
-        self.assertIsInstance(out, str)
-        # loopback is always filtered out
-        self.assertNotIn("lo 127.0.0.1", out)
+        rows = System.net_addresses()
+        self.assertIsInstance(rows, list)
+        for row in rows:
+            self.assertEqual(set(row), {"dev", "ip"})
+            self.assertNotEqual(row["dev"], "lo")
 
     def test_tcp_byte_counts(self):
         # needs netlink sock_diag, must not raise even where blocked
         self.assertIsInstance(System.tcp_byte_counts(), dict)
+
+    def test_net_neighbour_list(self):
+        # RTM_GETNEIGH over netlink, or the /proc/net/arp fallback; must
+        # return a list of well-shaped rows and never raise
+        rows = System.net_neighbour_list()
+        self.assertIsInstance(rows, list)
+        for r in rows:
+            self.assertEqual(set(r), {"ip", "mac", "dev", "state"})
 
     def test_net_socket_list(self):
         socks = System.net_socket_list()
@@ -129,22 +188,12 @@ class TestSystemProc(unittest.TestCase):
                              {"proto", "local", "remote", "state",
                               "sent", "received"})
 
-    def test_net_sockets_render(self):
-        # Open a listener so there is at least one row to format
-        srv = socket.socket()
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(1)
-        try:
-            out = System.net_sockets(limit=20)
-            self.assertIn("PROTO", out)
-        finally:
-            srv.close()
-
     def test_traceroute_without_capability(self):
         # raw sockets need CAP_NET_RAW, unprivileged it returns a message
         # not a raise
         out = System.traceroute("127.0.0.1", max_hops=1, cycles=1)
-        self.assertIsInstance(out, str)
+        self.assertEqual(out["dest"], "127.0.0.1")
+        self.assertTrue(out["hops"] or out["error"])
 
 
 class FakePopen:

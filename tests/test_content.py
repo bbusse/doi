@@ -8,55 +8,20 @@ import unittest
 from unittest import mock
 
 import doi.main as main
-from doi.main import (Art, Calendar, Music, News, OTD, PrometheusClient,
+from doi.main import (Calendar, Music, News, OTD, PrometheusClient,
                       Weather)
-
-
-class TestArtCaption(unittest.TestCase):
-    def test_full_meta(self):
-        caption = Art.caption({"title": "Irises", "artist": "van Gogh",
-                               "date": "1889", "source": "the Met"})
-        self.assertEqual(caption, "Irises, van Gogh, 1889 - the Met")
-
-    def test_partial_meta(self):
-        self.assertEqual(Art.caption({"title": "Irises"}), "Irises")
-        self.assertEqual(Art.caption({"source": "the Met"}), "the Met")
-
-    def test_meta_not_a_dict(self):
-        self.assertEqual(Art.caption("Irises"), "Irises")
-        self.assertEqual(Art.caption(None), "")
 
 
 class TestCalendarMonth(unittest.TestCase):
     def test_month_shape(self):
-        lines = Calendar.month_text()
-        self.assertGreater(len(lines), 4)
-        self.assertEqual(lines[1], "")
-        self.assertIn("Mo", lines[2])
-
-    def test_highlights_applied(self):
         import datetime
-        lines = Calendar.month_text(lambda m: f"<{m.group(0)}>",
-                                    lambda m: f"[{m.group(0)}]")
-        text = "\n".join(lines)
-        today = datetime.date.today()
-        self.assertIn(f"<{str(today.day).rjust(2)}>", text)
-        self.assertIn(f"[{today.strftime('%a')[:2]}]", text)
-
-    def test_holiday_lines(self):
-        holidays = [{"date": "2026-10-03", "name": "German Unity Day",
-                     "localName": "Tag der Deutschen Einheit"}]
-        with mock.patch.object(Calendar, "next_bank_holidays",
-                               return_value=holidays):
-            lines = Calendar.holiday_lines()
-        self.assertEqual(lines, ["2026-10-03: German Unity Day "
-                                 "(Tag der Deutschen Einheit)"])
-
-    def test_holiday_lines_no_data(self):
-        with mock.patch.object(Calendar, "next_bank_holidays",
-                               return_value=None):
-            self.assertEqual(Calendar.holiday_lines(), [])
-
+        month = Calendar.month(datetime.date(2026, 9, 6))
+        self.assertEqual(month["month_name"], "September")
+        self.assertEqual(month["weekdays"][0], "Mon")
+        self.assertEqual(month["today"], 6)
+        self.assertEqual(month["weeks"][0], [0, 1, 2, 3, 4, 5, 6])
+        self.assertEqual(month["weeks"][-1][-2:], [0, 0])
+        self.assertTrue(all(len(week) == 7 for week in month["weeks"]))
 
 class TestOTD(unittest.TestCase):
     @staticmethod
@@ -149,7 +114,7 @@ class Reply:
 
 class TestCacheImage(unittest.TestCase):
     def test_no_url(self):
-        self.assertEqual(main.cache_image("", "x-"), "")
+        self.assertEqual(main.cache_image(""), "")
 
     def test_fetch_and_reuse(self):
         import tempfile
@@ -161,8 +126,8 @@ class TestCacheImage(unittest.TestCase):
             return Reply(200, content=b"jpegbytes")
 
         with mock.patch.object(main.requests, "get", get):
-            first = main.cache_image("http://img/a.jpg", "x-", tmp)
-            second = main.cache_image("http://img/a.jpg", "x-", tmp)
+            first = main.cache_image("http://img/a.jpg", main.FileCache(tmp))
+            second = main.cache_image("http://img/a.jpg", main.FileCache(tmp))
 
         self.assertEqual(first, second)
         self.assertEqual(open(first, "rb").read(), b"jpegbytes")
@@ -173,14 +138,45 @@ class TestCacheImage(unittest.TestCase):
         with mock.patch.object(main.requests, "get",
                                lambda url, **kw: Reply(500)):
             self.assertEqual(
-                main.cache_image("http://img/a.jpg", "x-",
-                                 tempfile.mkdtemp(prefix="doi-img-")), "")
+                main.cache_image("http://img/a.jpg", main.FileCache(
+                    tempfile.mkdtemp(prefix="doi-img-"))), "")
+
+    def test_extension_from_content_type(self):
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="doi-img-")
+        webp = b"RIFF\x00\x00\x00\x00WEBPVP8 "
+
+        def get(url, **kw):
+            return Reply(200, content=webp,
+                         headers={"Content-Type": "image/webp"})
+
+        with mock.patch.object(main.requests, "get", get):
+            # url says .jpg, the response says webp -- the file is named webp
+            path = main.cache_image("http://img/a.jpg", main.FileCache(tmp))
+            self.assertTrue(path.endswith(".webp"))
+            # and a second call reuses it whatever the url extension was
+            self.assertEqual(main.cache_image("http://img/a.jpg", main.FileCache(tmp)),
+                             path)
+
+    def test_extension_from_magic_bytes(self):
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="doi-img-")
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+
+        with mock.patch.object(main.requests, "get",
+                               lambda url, **kw: Reply(200, content=png)):
+            self.assertTrue(
+                main.cache_image("http://img/x", main.FileCache(tmp)).endswith(".png"))
+
+    def test_extension_defaults_to_jpg(self):
+        self.assertEqual(main.image_extension(None, b"not an image"), ".jpg")
+        self.assertEqual(main.image_extension("image/jpeg", b""), ".jpg")
 
 
 class TestApod(unittest.TestCase):
     def test_meta_shape_and_caption(self):
         import tempfile
-        from doi.main import APOD, Art
+        from doi.main import APOD
 
         payload = {"title": "Eclipse Pair",
                    "copyright": " Jane Doe ",
@@ -194,14 +190,14 @@ class TestApod(unittest.TestCase):
             return Reply(200, content=b"jpegbytes")
 
         with mock.patch.object(main.requests, "get", get):
-            apod = APOD(save_dir=tempfile.mkdtemp(prefix="doi-test-apod-"))
+            apod = APOD(store=main.FileCache(tempfile.mkdtemp(prefix="doi-test-apod-")))
             img_path, meta = apod.apod_data()
 
         self.assertTrue(img_path.endswith(".jpg"))
         self.assertEqual(open(img_path, "rb").read(), b"jpegbytes")
-        self.assertEqual(
-            Art.caption(meta),
-            "Eclipse Pair, Jane Doe, 2026-08-29 - NASA APOD")
+        self.assertEqual(meta["title"], "Eclipse Pair")
+        self.assertEqual(meta["artist"], "Jane Doe")
+        self.assertEqual(meta["source"], "NASA APOD")
         self.assertEqual(meta["description"], "Two eclipses.")
 
     def test_video_day_no_image_keeps_meta(self):
@@ -261,10 +257,8 @@ class TestSpotify(unittest.TestCase):
         art_dir = tempfile.mkdtemp(prefix="doi-test-art-")
         with mock.patch.dict(os.environ, self.env), \
              mock.patch.object(main.requests, "post", post), \
-             mock.patch.object(main.requests, "get", get), \
-             mock.patch.object(main.tempfile, "gettempdir",
-                               return_value=art_dir):
-            music = Music()
+             mock.patch.object(main.requests, "get", get):
+            music = Music(store=main.FileCache(art_dir))
             item = music.spotify()
             self.assertEqual(item["artists"], "Radiohead")
             self.assertEqual(item["title"], "Paranoid Android")
@@ -301,50 +295,38 @@ WTTR = {"current_condition": [{"temp_C": "21",
         "nearest_area": [{"areaName": [{"value": "Berlin"}]}]}
 
 
-class TestWeatherReport(unittest.TestCase):
-    def weather(self, data, icon=None):
+class TestWeatherCurrent(unittest.TestCase):
+    def weather(self, data):
         weather = Weather.__new__(Weather)
         weather.location = "Berlin"
-        weather.weather = (data, icon)
+        weather.weather = data
         return weather
 
-    def test_report(self):
+    def test_current(self):
         with mock.patch.object(Calendar, "sunrise_sunset", return_value={
                     "today": {"sunrise": "06:10", "sunset": "20:05"}}), \
              mock.patch.object(Calendar, "moonphase",
                                return_value=("Full Moon", None, 0)), \
-             mock.patch.object(Weather, "fetch_uv_index",
-                               return_value="5"):
-            texts, icon = self.weather(WTTR).report()
-        self.assertIn("21°C", texts)
-        self.assertIn("Sunny 11 km/h", texts)
-        self.assertIn("Berlin", texts)
-        self.assertIn("Sunrise 06:10  Sunset 20:05", texts)
-        self.assertTrue(any("Full Moon" in t for t in texts))
-        self.assertTrue(any("UV Index 5 (Moderate)" in t for t in texts))
-        self.assertTrue(any("Children: Sunscreen and hat recommended" in t
-                            for t in texts))
+             mock.patch.object(Weather, "fetch_uv_index", return_value=5.0):
+            now = self.weather(WTTR).current()
+        self.assertEqual(now["temp_c"], 21)
+        self.assertEqual(now["condition"], "Sunny")
+        self.assertEqual(now["wind_kmh"], 11)
+        self.assertEqual(now["area"], "Berlin")
+        self.assertEqual((now["sunrise"], now["sunset"]), ("06:10", "20:05"))
+        self.assertEqual(now["moon_phase"], "Full Moon")
+        self.assertEqual(now["days_to_full_moon"], 0)
+        self.assertEqual(now["uv_index"], 5.0)
 
-    def test_uv_risk(self):
-        self.assertIn("(Low)", Weather.uv_risk("1"))
-        self.assertIn("(Moderate)", Weather.uv_risk(5))
-        self.assertIn("(High)", Weather.uv_risk("6.4"))
-        self.assertIn("(Very High)", Weather.uv_risk(9))
-        self.assertIn("(Extreme)", Weather.uv_risk(11))
-        self.assertIsNone(Weather.uv_risk(None))
-        self.assertIsNone(Weather.uv_risk("n/a"))
-
-    def test_report_no_data(self):
+    def test_current_no_data(self):
         with mock.patch.object(Calendar, "sunrise_sunset",
                                return_value=None), \
              mock.patch.object(Calendar, "moonphase",
                                return_value=(None, None, None)), \
              mock.patch.object(Weather, "fetch_uv_index",
                                return_value=None):
-            texts, icon = self.weather(None).report()
-        self.assertIn("Weather data unavailable", texts)
-        self.assertIsNone(icon)
-
+            now = self.weather(None).current()
+        self.assertTrue(all(v is None for v in now.values()))
 
 class TestArtNGA(unittest.TestCase):
     # uuid, iiifurl, iiifthumburl, viewtype, sequence, width, height,
@@ -379,15 +361,14 @@ class TestArtNGA(unittest.TestCase):
              mock.patch.object(main.requests, "get", get), \
              mock.patch.object(main.ArtNGA, "object_meta", return_value=meta):
             path, out = main.ArtNGA(
-                save_dir=tempfile.mkdtemp(prefix="doi-test-nga-")).art_data()
+                store=main.FileCache(tempfile.mkdtemp(prefix="doi-test-nga-"))).art_data()
 
-        self.assertTrue(path.endswith("art-nga.jpg"))
+        self.assertTrue(path.endswith(".jpg"))
         self.assertEqual(open(path, "rb").read(), b"jpegbytes")
         self.assertEqual(out["source"], "National Gallery of Art")
         self.assertEqual(out["description"], "A field of irises")
-        self.assertEqual(
-            Art.caption(out),
-            "Irises, van Gogh, 1889 - National Gallery of Art")
+        self.assertEqual((out["title"], out["artist"], out["date"]),
+                         ("Irises", "van Gogh", "1889"))
 
 
 class TestArtMet(unittest.TestCase):
@@ -410,15 +391,13 @@ class TestArtMet(unittest.TestCase):
 
         with mock.patch.object(main.requests, "get", get):
             path, work = main.ArtMet(
-                save_dir=tempfile.mkdtemp(prefix="doi-test-met-")).art_data()
+                store=main.FileCache(tempfile.mkdtemp(prefix="doi-test-met-"))).art_data()
 
-        self.assertTrue(path.endswith("art-met.jpg"))
+        self.assertTrue(path.endswith(".jpg"))
         self.assertEqual(open(path, "rb").read(), b"jpegbytes")
         self.assertEqual(work["source"], "The Metropolitan Museum of Art")
-        self.assertEqual(
-            Art.caption(work),
-            "Wheat Field with Cypresses, Vincent van Gogh, 1889"
-            " - The Metropolitan Museum of Art")
+        self.assertEqual((work["title"], work["artist"], work["date"]),
+                         ("Wheat Field with Cypresses", "Vincent van Gogh", "1889"))
 
 
 class TestBankHolidays(unittest.TestCase):
@@ -494,13 +473,12 @@ class TestWttrSources(unittest.TestCase):
     def test_fetch_weather_via_constructor(self):
         with mock.patch.object(main.requests, "get", self.wttr()):
             weather = Weather("Berlin")
-        data, _ = weather.current_weather()
-        self.assertEqual(data["current_condition"][0]["temp_C"], "21")
+        self.assertEqual(weather.weather["current_condition"][0]["temp_C"], "21")
 
     def test_fetch_uv_index(self):
         with mock.patch.object(main.requests, "get", lambda url, **kw:
                                Reply(200, text="5\n")):
-            self.assertEqual(Weather.fetch_uv_index(location="Berlin"), "5")
+            self.assertEqual(Weather.fetch_uv_index(location="Berlin"), 5.0)
 
 
 RSS_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
@@ -588,7 +566,7 @@ class TestBluesky(unittest.TestCase):
 
     def mk(self, actor="financialtimes.com", **kw):
         import tempfile
-        kw.setdefault("image_dir", tempfile.mkdtemp(prefix="doi-bsky-"))
+        kw.setdefault("store", main.FileCache(tempfile.mkdtemp(prefix="doi-bsky-")))
         return main.Bluesky(actor, **kw)
 
     @staticmethod
@@ -688,6 +666,27 @@ class TestBluesky(unittest.TestCase):
         # nothing attached
         self.assertEqual(embed({}), ("", "", ""))
 
+    def test_pin_jpeg(self):
+        pin = main.Bluesky._pin_jpeg
+        self.assertEqual(pin("https://cdn.bsky.app/img/f/1.jpg"),
+                         "https://cdn.bsky.app/img/f/1.jpg@jpeg")
+        # an explicit format is left as it is
+        self.assertEqual(pin("https://cdn.bsky.app/img/f/1.jpg@png"),
+                         "https://cdn.bsky.app/img/f/1.jpg@png")
+        # only the bsky cdn
+        self.assertEqual(pin("https://example.com/x.webp"),
+                         "https://example.com/x.webp")
+        self.assertEqual(pin(""), "")
+
+    def test_image_downloaded_as_jpeg(self):
+        get, calls = self.transport()
+        with mock.patch.object(main.requests, "get", get):
+            bsky = self.mk()
+            for _ in range(len(BSKY_FEED["feed"])):
+                bsky.post_item()
+        self.assertTrue(
+            all(c.endswith("@jpeg") for c in calls if isinstance(c, str)))
+
     def test_lazy_and_cached_within_ttl(self):
         get, calls = self.transport()
         with mock.patch.object(main.requests, "get", get):
@@ -744,7 +743,7 @@ class TestMQTT(unittest.TestCase):
         captured = []
         client = mock.Mock()
         MQTT("broker", "cid").subscribe(
-            client, topic, lambda t, texts: captured.append((t, texts)))
+            client, topic, lambda t, payload: captured.append((t, payload)))
         on_message = client.message_callback_add.call_args[0][1]
         on_message(client, None, mock.Mock(topic=topic, payload=payload))
         return captured
@@ -755,16 +754,16 @@ class TestMQTT(unittest.TestCase):
             b'{"title": "Paranoid Android", "file": "radiohead.flac"}')
         self.assertEqual(captured,
                          [("hyperblast/current_song",
-                           ["Paranoid Android", "[radiohead.flac]"])])
+                           {"title": "Paranoid Android", "file": "radiohead.flac"})])
 
     def test_temperature_sensor(self):
         captured = self.message_handler(
             "sensor/mainhallsensor/temperature", b'{"value": 21.4}')
-        self.assertEqual(captured[0][1], ["Mainhall", "21.4 °C"])
+        self.assertEqual(captured[0][1], {"value": 21.4})
 
     def test_plain_text_payload(self):
         captured = self.message_handler("some/other/topic", b"just text")
-        self.assertEqual(captured[0][1], ["just text"])
+        self.assertEqual(captured[0][1], "just text")
 
 
 class TestPrometheusClient(unittest.TestCase):
@@ -836,7 +835,7 @@ class TestDegradation(unittest.TestCase):
         from doi.main import APOD
         with mock.patch.object(main.requests, "get",
                                lambda url, **kw: Reply(503)):
-            out = APOD(save_dir=tempfile.mkdtemp(prefix="doi-t-")).apod_data()
+            out = APOD(store=main.FileCache(tempfile.mkdtemp(prefix="doi-t-"))).apod_data()
         self.assertEqual(out, (None, None))
 
     def test_art_nga_unreachable(self):
@@ -844,7 +843,7 @@ class TestDegradation(unittest.TestCase):
         with mock.patch.object(main.requests, "head", unreachable), \
              mock.patch.object(main.requests, "get", unreachable):
             out = main.ArtNGA(
-                save_dir=tempfile.mkdtemp(prefix="doi-t-")).art_data()
+                store=main.FileCache(tempfile.mkdtemp(prefix="doi-t-"))).art_data()
         self.assertEqual(out, (None, None))
 
     def test_art_met_no_images(self):
@@ -852,7 +851,7 @@ class TestDegradation(unittest.TestCase):
         with mock.patch.object(main.requests, "get", lambda url, **kw:
                                Reply(200, {"objectIDs": []})):
             out = main.ArtMet(
-                save_dir=tempfile.mkdtemp(prefix="doi-t-")).art_data()
+                store=main.FileCache(tempfile.mkdtemp(prefix="doi-t-"))).art_data()
         self.assertEqual(out, (None, None))
 
     def test_spotify_currently_playing_error(self):
@@ -884,10 +883,12 @@ class TestDegradation(unittest.TestCase):
     def test_weather_unreachable(self):
         with mock.patch.object(main.requests, "get", unreachable):
             weather = Weather("Berlin")
-        self.assertEqual(weather.current_weather(), (None, None))
-        # report() still yields lines rather than raising
-        texts, icon = weather.report()
-        self.assertIn("Weather data unavailable", texts)
+        self.assertIsNone(weather.weather)
+        with mock.patch.object(Calendar, "sunrise_sunset", return_value=None), \
+             mock.patch.object(Calendar, "moonphase",
+                               return_value=(None, None, None)), \
+             mock.patch.object(Weather, "fetch_uv_index", return_value=None):
+            self.assertIsNone(weather.current()["temp_c"])
 
     def test_uv_index_http_error(self):
         with mock.patch.object(main.requests, "get",
