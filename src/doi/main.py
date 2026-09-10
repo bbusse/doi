@@ -1,6 +1,4 @@
 import csv
-import glob
-import hashlib
 import io
 import ipaddress
 import logging
@@ -21,6 +19,8 @@ import xml.etree.ElementTree as ET
 __version__ = "0.1.0"
 import requests
 from paho.mqtt import client as mqtt_client
+
+from doi.cache import FileCache, cache  # noqa: F401
 
 USER_AGENT = f"doi/{__version__} (https://github.com/bbusse/doi)"
 
@@ -58,40 +58,36 @@ def image_extension(content_type, content):
     return ".jpg"
 
 
-def cache_image(url, prefix, save_dir=None):
+def cache_image(url, store=None, timeout=10):
     '''
-    Download an image to a local file keyed by url and return its path, so a
-    picture asked for repeatedly is fetched once. The extension follows the
-    response Content-Type. Empty string on no url or a failed fetch
+    A picture by url as a local file, fetched once and kept in the store, the
+    shared cache unless one is given. The extension follows the response
+    Content-Type. Empty string on no url or a failed fetch
     '''
     if not url:
         return ""
 
-    save_dir = save_dir or tempfile.gettempdir()
-    name = hashlib.md5(url.encode()).hexdigest()
-    for path in glob.glob(os.path.join(save_dir, f"{prefix}{name}.*")):
-        if os.path.getsize(path) > 0:
-            return path
+    store = store or cache
+    path = store.path(url)
+    if path:
+        return path
 
     try:
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=timeout)
         resp.raise_for_status()
         ext = image_extension(resp.headers.get("Content-Type"), resp.content)
-        path = os.path.join(save_dir, f"{prefix}{name}{ext}")
-        with open(path, "wb") as f:
-            f.write(resp.content)
+
+        return store.put(url, resp.content, ext)
     except (requests.RequestException, OSError) as e:
         logging.warning(f"cache_image: {url}: {e}")
         return ""
 
-    return path
-
 
 class APOD:
 
-    def __init__(self, api_key="DEMO_KEY", save_dir="/tmp"):
+    def __init__(self, api_key="DEMO_KEY", store=None):
         self.api_key = api_key
-        self.save_dir = save_dir
+        self.store = store or cache
 
     def apod_data(self):
         """
@@ -138,11 +134,8 @@ class APOD:
                 return None, meta
 
             img_ext = os.path.splitext(img_url.split("?", 1)[0])[-1] or ".jpg"
-            img_path = os.path.join(self.save_dir, f"apod{img_ext}")
-            with open(img_path, "wb") as f:
-                f.write(img_resp.content)
 
-            return img_path, meta
+            return self.store.put(img_url, img_resp.content, img_ext), meta
         except Exception as e:
             logging.error(f"APOD: Error fetching APOD: {e}")
             return None, None
@@ -151,47 +144,19 @@ class APOD:
 class Art:
     """
     Base for the collection sources. Each one picks a work at random and
-    returns a local image path plus a caption.
+    returns a local image path plus its meta: title, artist, date, source
     """
 
-    def __init__(self, save_dir="/tmp", width=1280, height=800):
-        self.save_dir = save_dir
+    def __init__(self, store=None, width=1280, height=800):
+        self.store = store or cache
         self.width = width
         self.height = height
 
-    def save_image(self, url, name, timeout=20):
-        r = requests.get(url, timeout=timeout)
-        if r.status_code != 200:
-            logging.error(f"Art: Failed to download image: {r.status_code}")
-
-            return None
-
-        path = os.path.join(self.save_dir, name)
-        with open(path, "wb") as f:
-            f.write(r.content)
-
-        return path
+    def save_image(self, url):
+        return cache_image(url, self.store, timeout=20) or None
 
     def art_data(self):
         raise NotImplementedError
-
-    @staticmethod
-    def caption(meta):
-        '''
-        One line naming a work: title, artist and date, with the collection
-        appended when it is known
-        '''
-        if not isinstance(meta, dict):
-            return str(meta or "")
-
-        caption = ", ".join(p for p in (meta.get("title"),
-                                        meta.get("artist"),
-                                        meta.get("date")) if p)
-        source = meta.get("source", "")
-        if source:
-            caption = f"{caption} - {source}" if caption else source
-
-        return caption
 
 
 class ArtNGA(Art):
@@ -319,7 +284,7 @@ class ArtNGA(Art):
 
             url = self.iiif.format(uuid=row["uuid"], width=self.width,
                                    height=self.height)
-            path = self.save_image(url, "art-nga.jpg")
+            path = self.save_image(url)
             meta = self.object_meta(row["objectid"])
             meta["description"] = row["text"] or ""
             meta["source"] = "National Gallery of Art"
@@ -389,7 +354,7 @@ class ArtMet(Art):
 
                 return None, None
 
-            path = self.save_image(work["image"], "art-met.jpg")
+            path = self.save_image(work["image"])
             work["source"] = "The Metropolitan Museum of Art"
 
             return path, work
@@ -405,7 +370,8 @@ class Music:
     spotify_playing_url = ("https://api.spotify.com/v1/me/player"
                            "/currently-playing")
 
-    def __init__(self):
+    def __init__(self, store=None):
+        self.store = store or cache
         self.music = {'mpd_data'   : False,
                       'mpd_state'  : False,
                       'mpd_artist' : "",
@@ -507,7 +473,7 @@ class Music:
                                      for a in item.get("artists") or []),
                 "album": album.get("name", ""),
                 "url": (item.get("external_urls") or {}).get("spotify", ""),
-                "art_file": cache_image(art_url, "spotify-art-"),
+                "art_file": cache_image(art_url, self.store),
                 "is_playing": data.get("is_playing", False),
                 "progress_ms": data.get("progress_ms") or 0,
                 "duration_ms": item.get("duration_ms") or 0}
@@ -565,44 +531,24 @@ class Calendar:
             return None
 
     @staticmethod
-    def month_text(highlight=None, highlight_day_name=None):
+    def month(today=None):
         '''
-        The current month as lines, with an empty line after the month name.
-        Today's day number and day name pass through the given callables
-        (each takes a re.Match), so a caller can mark them up for wherever
-        the lines end up
+        The current month as data: year, month and its name, the weekday
+        abbreviations, the weeks as rows of day numbers with 0 outside the
+        month, and today's day
         '''
         import calendar
         import datetime
-        import re
 
-        today = datetime.date.today()
-        lines = calendar.TextCalendar(calendar.MONDAY) \
-            .formatmonth(today.year, today.month).split('\n')
-        if len(lines) > 1:
-            lines = lines[:1] + [''] + lines[1:]
+        today = today or datetime.date.today()
+        cal = calendar.Calendar(calendar.MONDAY)
 
-        # The header row abbreviates day names to two letters, so the
-        # marker for today's name has to as well
-        day_str = str(today.day).rjust(2)
-        day_abbr = today.strftime("%a")[:2]
-        out = []
-        for line in lines:
-            if highlight:
-                line = re.sub(rf'(?<!\d){day_str}(?!\d)', highlight, line)
-            if highlight_day_name:
-                line = re.sub(rf'\b{day_abbr}\b', highlight_day_name, line)
-            out.append(line)
-
-        return out
-
-    @staticmethod
-    def holiday_lines(location="Germany", count=3):
-        '''The next bank holidays, one line each'''
-        holidays = Calendar.next_bank_holidays(location=location, count=count)
-
-        return [f"{h['date']}: {h['name']} ({h['localName']})"
-                for h in holidays or []]
+        return {"year": today.year,
+                "month": today.month,
+                "month_name": calendar.month_name[today.month],
+                "weekdays": [calendar.day_abbr[d] for d in cal.iterweekdays()],
+                "weeks": cal.monthdayscalendar(today.year, today.month),
+                "today": today.day}
 
     @staticmethod
     def next_bank_holidays(location="Germany", count=3):
@@ -775,7 +721,6 @@ class MQTT:
         self.port = port
         self.user = user
         self.pw = pw
-        self.mqtt_views = list()
 
     def connect(self):
         # paho-mqtt v2 callback signature support
@@ -807,50 +752,17 @@ class MQTT:
 
     def subscribe(self, client: mqtt_client, topic, on_message_callback):
         def on_message(client, userdata, msg):
-            self.active_msg = ""
             try:
                 jm = msg.payload.decode(errors='ignore')
             except Exception:
                 jm = ""
-
-            # Try JSON parse, fall back to raw text
             try:
                 m = json.loads(jm)
-            except Exception:
+            except ValueError:
                 m = None
 
             logging.info(f"Received `{m if m is not None else jm}` in  `{msg.topic}`")
-            texts = []
-
-            topic = msg.topic or ""
-            if isinstance(m, dict):
-                if topic == "hyperblast/current_song":
-                    title = m.get("title") or ""
-                    file_name = m.get("file") or ""
-                    if title:
-                        texts.append(title)
-                    if file_name:
-                        texts.append(f"[{file_name}]")
-                elif topic == "sensor/mainhallsensor/temperature":
-                    texts.append("Mainhall")
-                    val = m.get("value") if isinstance(m.get("value"), (int, float, str)) else m
-                    texts.append(f"{val} °C")
-                else:
-                    # Generic dict payload
-                    texts.append(json.dumps(m, ensure_ascii=False))
-            elif m is not None:
-                # JSON but not dict (e.g. list/number/string)
-                texts.append(json.dumps(m, ensure_ascii=False))
-            else:
-                # Not JSON, raw text
-                if jm:
-                    texts.append(jm)
-
-            if not texts:
-                texts = [str(jm)]
-
-            on_message_callback(topic, texts)
-            self.mqtt_views.append(msg.topic)
+            on_message_callback(msg.topic or "", m if m is not None else jm)
 
         client.subscribe(topic)
         # Register per-topic callback without clobbering global on_message
@@ -1077,12 +989,12 @@ class Bluesky:
     # poll every few seconds
     refetch_after_s = 600
 
-    def __init__(self, actor, limit=30, include_reposts=False, image_dir=None):
+    def __init__(self, actor, limit=30, include_reposts=False, store=None):
         # actor is a handle, a did or a profile url
         self.actor = actor.rstrip("/").split("/profile/")[-1]
         self.limit = limit
         self.include_reposts = include_reposts
-        self.image_dir = image_dir
+        self.store = store or cache
         self._items = []
         self._fetched_at = None
         self._lock = threading.Lock()
@@ -1194,7 +1106,7 @@ class Bluesky:
         self._items.append(item)
         # picture resolved here, not during parse, so only shown posts fetch
         item["image"] = cache_image(self._pin_jpeg(item.get("image_url", "")),
-                                    "bsky-img-", self.image_dir)
+                                    self.store)
         return item
 
 
@@ -1449,60 +1361,24 @@ def _note_missing_tool(tool):
 
 class System:
 
-    def list_processes(limit=0):
-        # Choose ps variant by platform
-        system = platform.system()
-        if system == 'Linux':
-            # Processes without kernel threads
-            cmd = ['ps', 'wux', '--ppid', '2', '-p', '2', '--deselect']
-        elif system in ('Darwin', 'FreeBSD'):
-            cmd = ['ps', 'aux']
-        else:
-            cmd = ['ps', 'aux']
-
-        try:
-            ps = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                shell=False,
-                encoding="utf8"
-            ).communicate()[0]
-        except FileNotFoundError:
-            _note_missing_tool("ps")
-            ps = System._processes_from_proc()
-        except Exception as e:
-            logging.error(f"ps failed: {e}")
-            ps = ""
-        if limit and ps:
-            lines = ps.splitlines()
-            return "\n".join(lines[:max(0, limit)])
-        return ps
-
-    def _processes_from_proc():
-        try:
-            entries = sorted(
-                (e for e in os.scandir('/proc') if e.name.isdigit()),
-                key=lambda e: int(e.name)
-            )
-        except OSError as e:
-            return f"Process list unavailable: {e}"
-
-        lines = ["PID    COMMAND"]
-        for entry in entries:
-            pid = entry.name
+    @staticmethod
+    def process_list():
+        '''
+        Every process as its process_cpu_times row plus the command line,
+        by pid. A kernel thread has no command line and shows its name in
+        brackets, the way ps does
+        '''
+        procs = System.process_cpu_times()
+        for proc in procs:
             try:
-                with open(f'/proc/{pid}/cmdline', encoding='utf8') as f:
-                    cmdline = f.read().replace('\x00', ' ').strip()
-                if not cmdline:
-                    with open(f'/proc/{pid}/status', encoding='utf8') as f:
-                        for line in f:
-                            if line.startswith('Name:'):
-                                cmdline = '[' + line.split(':', 1)[1].strip() + ']'
-                                break
-                lines.append(f"{pid:<6} {cmdline}")
+                with open(f"/proc/{proc['pid']}/cmdline", encoding="utf-8") as f:
+                    cmdline = f.read().replace("\x00", " ").strip()
             except OSError:
-                continue
-        return "\n".join(lines)
+                cmdline = ""
+            proc["cmdline"] = cmdline or f"[{proc['name']}]"
+        procs.sort(key=lambda p: p["pid"])
+
+        return procs
 
     def os_release():
         data = ""
@@ -1519,27 +1395,20 @@ class System:
             logging.error(f"Failed reading /etc/os-release: {e}")
         return data
 
-    def sys_data():
-        sys = {"data" : None,
-               "uptime" : ""}
-        sysdata = Py3status("sysdata")
-        data = sysdata.run_module()
-        sys["data"] = data
-        uptime = Py3status("uptime")
-        sys["uptime"] = uptime.run_module()
-
-        return sys
+    def sysdata():
+        '''The py3status sysdata line, cpu and memory as that module formats it'''
+        return Py3status("sysdata").run_module()
 
     @staticmethod
     def net_addresses():
         '''
-        The machine's own addresses by interface, without the loopback,
+        The machine's own addresses as rows of dev and ip, without the loopback,
         read from the kernel rather than from a shelled-out tool
         '''
         import array
         import fcntl
 
-        lines = []
+        rows = []
 
         # IPv4 over SIOCGIFCONF: the kernel fills ifreq structs of name
         # and address, 40 bytes each on 64 bit
@@ -1556,7 +1425,7 @@ class System:
                 name = data[n:n + 16].split(b'\0', 1)[0].decode()
                 address = socket.inet_ntoa(data[n + 20:n + 24])
                 if name != "lo" and not address.startswith("127."):
-                    lines.append(f"{name} {address}")
+                    rows.append({"dev": name, "ip": address})
         except (OSError, ValueError) as e:
             logging.warning(f"net: Failed to list IPv4 addresses: {e}")
 
@@ -1570,13 +1439,13 @@ class System:
                                                bytes.fromhex(fields[0]))
                     name = fields[5]
                     if name != "lo" and address != "::1":
-                        lines.append(f"{name} {address}")
+                        rows.append({"dev": name, "ip": address})
         except FileNotFoundError:
             pass
         except (OSError, ValueError) as e:
             logging.warning(f"net: Failed to list IPv6 addresses: {e}")
 
-        return "\n".join(lines)
+        return rows
 
     def net_data(probe_ip_address):
         net = {"address" : None,
@@ -1605,6 +1474,20 @@ class System:
         except Exception as e:
             logging.error(f"Failed reading /etc/resolv.conf: {e}")
         return data
+
+    # The kernel's own high water mark of a process's resident set, so a
+    # spike between two samples is not lost. 0 for a kernel thread
+    @staticmethod
+    def rss_peak(pid):
+        try:
+            with open(f"/proc/{pid}/status", encoding='utf-8') as f:
+                for line in f:
+                    if line.startswith("VmHWM:"):
+                        return int(line.split()[1]) * 1024
+        except (OSError, ValueError, IndexError):
+            pass
+
+        return 0
 
     @staticmethod
     def process_cpu_times():
@@ -1640,46 +1523,27 @@ class System:
                           "cpu_s": cpu_s,
                           "threads": threads,
                           "starttime": starttime,
-                          "rss_b": rss_b})
+                          "rss_b": rss_b,
+                          "rss_peak_b": System.rss_peak(entry)})
 
         return procs
 
     @staticmethod
-    def mem_data():
-        wanted = {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}
+    def memory():
+        '''Total, available and swap in bytes from /proc/meminfo, or None'''
+        wanted = {"MemTotal": "total_b", "MemAvailable": "available_b",
+                  "SwapTotal": "swap_total_b", "SwapFree": "swap_free_b"}
         fields = {}
         try:
             with open("/proc/meminfo", encoding="utf-8") as f:
                 for line in f:
                     name, _, rest = line.partition(":")
-                    if name not in wanted:
-                        continue
-                    value = rest.split()
-                    if value:
-                        fields[name] = int(value[0]) * 1024
-                    if len(fields) == len(wanted):
-                        break
+                    if name in wanted and rest.split():
+                        fields[wanted[name]] = int(rest.split()[0]) * 1024
         except (OSError, ValueError):
-            return ""
+            return None
 
-        total = fields.get("MemTotal")
-        available = fields.get("MemAvailable")
-        if not total:
-            return ""
-
-        text = f"Memory: {System.human_bytes(total)} total"
-        if available is not None:
-            text += (f", {System.human_bytes(total - available)} used"
-                     f", {System.human_bytes(available)} available")
-
-        swap_total = fields.get("SwapTotal")
-        swap_free = fields.get("SwapFree")
-        if swap_total:
-            used = swap_total - (swap_free or 0)
-            text += (f" -- Swap: {System.human_bytes(swap_total)} total"
-                     f", {System.human_bytes(used)} used")
-
-        return text
+        return fields if fields.get("total_b") else None
 
     # One walk answers both the biggest files and the biggest directories,
     # so both callers share it rather than each paying for a traversal
@@ -1703,30 +1567,15 @@ class System:
             return None
 
     @staticmethod
-    def host_uptime():
-        """ Host uptime as a short human string, e.g. '3d 4h 12m' """
-        seconds = System.host_uptime_seconds()
-        if seconds is None:
-            return "unknown"
+    def load_average():
+        '''The 1, 5 and 15 minute load from /proc/loadavg, or None'''
+        try:
+            with open('/proc/loadavg', encoding='utf-8') as f:
+                return [float(v) for v in f.read().split()[:3]]
+        except (OSError, ValueError) as e:
+            logging.debug(f"uptime: Cannot read /proc/loadavg: {e}")
 
-        days, rest = divmod(int(seconds), 86400)
-        hours, rest = divmod(rest, 3600)
-        minutes = rest // 60
-        parts = []
-        if days:
-            parts.append(f"{days}d")
-        if days or hours:
-            parts.append(f"{hours}h")
-        parts.append(f"{minutes}m")
-
-        return " ".join(parts)
-
-    @staticmethod
-    def human_bytes(n):
-        for unit in ("B", "K", "M", "G", "T"):
-            if n < 1024 or unit == "T":
-                return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
-            n /= 1024
+            return None
 
     @staticmethod
     def scan_sizes(path="/", limit=12, budget_s=20.0, max_entries=2_000_000):
@@ -1802,34 +1651,6 @@ class System:
         return result
 
     @staticmethod
-    def biggest_files(path="/", limit=12):
-        scan = System.scan_sizes(path, limit)
-        if not scan["files"]:
-            return f"No files found under {path}"
-
-        lines = [f"{'SIZE':>9}  FILE"]
-        for size, name in scan["files"]:
-            lines.append(f"{System.human_bytes(size):>9}  {name}")
-        if scan["truncated"]:
-            lines.append("... scan stopped early, results are partial")
-
-        return "\n".join(lines)
-
-    @staticmethod
-    def biggest_dirs(path="/", limit=12):
-        scan = System.scan_sizes(path, limit)
-        if not scan["dirs"]:
-            return f"No directories found under {path}"
-
-        lines = [f"{'SIZE':>9}  DIRECTORY"]
-        for size, name in scan["dirs"]:
-            lines.append(f"{System.human_bytes(size):>9}  {name}")
-        if scan["truncated"]:
-            lines.append("... scan stopped early, results are partial")
-
-        return "\n".join(lines)
-
-    @staticmethod
     def icmp_checksum(data):
         if len(data) % 2:
             data += b"\x00"
@@ -1901,24 +1722,37 @@ class System:
 
     @staticmethod
     def traceroute(target, max_hops=20, wait_s=1, cycles=5, timeout_s=120):
+        '''
+        The route to target: dest, cycles, the hops by ttl with the hosts
+        that answered, the probes sent and the round trip times in ms,
+        stopped when the time budget ran out. Only error is set when the
+        trace could not run at all
+        '''
+        trace = {"target": target, "dest": None, "cycles": cycles,
+                 "hops": [], "stopped": False, "error": None}
         if not target:
-            return "No traceroute target"
+            trace["error"] = "no target"
+            return trace
 
         try:
             dest = socket.gethostbyname(target)
         except OSError as e:
             logging.warning(f"traceroute: cannot resolve {target}: {e}")
-            return f"Cannot resolve {target}"
+            trace["error"] = f"cannot resolve {target}"
+            return trace
+        trace["dest"] = dest
 
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
                                  socket.IPPROTO_ICMP)
         except PermissionError:
             logging.warning("traceroute: raw sockets need CAP_NET_RAW")
-            return "Traceroute needs CAP_NET_RAW"
+            trace["error"] = "raw sockets need CAP_NET_RAW"
+            return trace
         except OSError as e:
             logging.warning(f"traceroute: cannot open a raw socket: {e}")
-            return "Traceroute cannot open a raw socket"
+            trace["error"] = "cannot open a raw socket"
+            return trace
 
         ident = os.getpid() & 0xffff
         deadline = time.monotonic() + timeout_s
@@ -1951,59 +1785,10 @@ class System:
                 if stopped:
                     break
 
-        if not hops:
-            return f"No reply from any hop towards {dest}"
+        trace["hops"] = [{"ttl": ttl, **hops[ttl]} for ttl in sorted(hops)]
+        trace["stopped"] = stopped
 
-        shown = dest if dest == target else f"{target} ({dest})"
-        lines = [f"Trace to {shown}, {cycles} cycles\n",
-                 f"{'HOP':>3}  {'HOST':<22} {'LOSS%':>6} {'SNT':>4}"
-                 f" {'LAST':>7} {'AVG':>7} {'BEST':>7} {'WRST':>7}"]
-
-        for ttl in range(1, max(hops) + 1):
-            hop = hops.get(ttl)
-            if hop is None:
-                continue
-
-            host = hop["hosts"][0] if hop["hosts"] else "???"
-            if len(hop["hosts"]) > 1:
-                host += f" +{len(hop['hosts']) - 1}"
-
-            times = hop["times"]
-            loss = 100.0 * (hop["sent"] - len(times)) / hop["sent"]
-            if times:
-                stats = (f" {times[-1]:>7.1f} {sum(times) / len(times):>7.1f}"
-                         f" {min(times):>7.1f} {max(times):>7.1f}")
-            else:
-                stats = f" {'-':>7} {'-':>7} {'-':>7} {'-':>7}"
-
-            lines.append(f"{ttl:>3}  {host:<22} {loss:>5.1f}%"
-                         f" {hop['sent']:>4}{stats}")
-
-        if stopped:
-            lines.append(f"... stopped after {timeout_s}s")
-
-        return "\n".join(lines)
-
-    @staticmethod
-    def top(limit=0):
-        procs = System.process_cpu_times()
-        if not procs:
-            return ""
-
-        procs.sort(key=lambda p: p["cpu_s"], reverse=True)
-        shown = procs[:limit] if limit else procs
-
-        lines = [f"{'PID':>7}  {'CPU TIME':>12}  {'MEM':>7}  COMMAND"]
-        for proc in shown:
-            minutes, seconds = divmod(proc["cpu_s"], 60)
-            cpu_time = f"{int(minutes)}m{seconds:04.1f}s"
-            lines.append(f"{proc['pid']:>7}  {cpu_time:>12}"
-                         f"  {System.human_bytes(proc['rss_b']):>7}"
-                         f"  {proc['name']}")
-        if limit and len(procs) > limit:
-            lines.append(f"... {len(procs) - limit} more of {len(procs)}")
-
-        return "\n".join(lines)
+        return trace
 
     tcp_states = {"01": "ESTABLISHED",
                   "02": "SYN_SENT",
@@ -2166,37 +1951,6 @@ class System:
 
         return sockets
 
-    @staticmethod
-    def net_sockets(limit=0):
-        sockets = System.net_socket_list()
-        if not sockets:
-            return ""
-
-        # Listeners first, then live connections, then the closing and wait
-        # states last: a row of TIME_WAIT from loopback scrape churn should
-        # not push the sockets that matter off the top of the view
-        transient = {"TIME_WAIT", "CLOSE_WAIT", "FIN_WAIT1", "FIN_WAIT2",
-                     "CLOSING", "LAST_ACK", "CLOSE"}
-        order = {"LISTEN": 0, "ESTABLISHED": 1, "UNCONN": 2}
-        sockets.sort(key=lambda s: (4 if s["state"] in transient
-                                    else order.get(s["state"], 3),
-                                    s["proto"], s["local"]))
-        shown = sockets[:limit] if limit else sockets
-
-        lines = [f"{'PROTO':<4} {'LOCAL':<24} {'REMOTE':<24}"
-                 f" {'STATE':<11} {'SENT':>8} {'RECV':>8}"]
-        for s in shown:
-            sent = System.human_bytes(s["sent"]) if s.get("sent") is not None else "-"
-            received = (System.human_bytes(s["received"])
-                        if s.get("received") is not None else "-")
-            lines.append(f"{s['proto']:<4} {s['local'][:24]:<24}"
-                         f" {s['remote'][:24]:<24} {s['state']:<11}"
-                         f" {sent:>8} {received:>8}")
-        if limit and len(sockets) > limit:
-            lines.append(f"... {len(sockets) - limit} more of {len(sockets)}")
-
-        return "\n".join(lines)
-
     # linux/neighbour.h: struct ndmsg is family/pad1 u8, pad2 u16,
     # ifindex s32, state u16, flags u8, type u8
     _NDA_DST = 1
@@ -2311,34 +2065,6 @@ class System:
         return entries or System._arp_from_proc()
 
     @staticmethod
-    def net_neighbours(limit=0):
-        rows = System.net_neighbour_list()
-        if not rows:
-            return ""
-
-        order = {"REACHABLE": 0, "PERMANENT": 0, "DELAY": 1, "PROBE": 1,
-                 "STALE": 2, "NOARP": 3, "FAILED": 4, "INCOMPLETE": 4}
-
-        def key(r):
-            try:
-                addr = ipaddress.ip_address(r["ip"])
-                ipk = (addr.version, int(addr))
-            except ValueError:
-                ipk = (9, 0)
-            return (order.get(r["state"], 3), r["dev"], ipk)
-
-        rows.sort(key=key)
-        shown = rows[:limit] if limit else rows
-
-        lines = [f"{'IP':<39} {'MAC':<17} {'DEV':<10} STATE"]
-        for r in shown:
-            lines.append(f"{r['ip']:<39} {r['mac'] or '-':<17}"
-                         f" {r['dev']:<10} {r['state']}")
-        if limit and len(rows) > limit:
-            lines.append(f"... {len(rows) - limit} more of {len(rows)}")
-
-        return "\n".join(lines)
-
     def net_valid_ip_address(ip_address):
         # An unset target is expected and not an error
         if not ip_address:
@@ -2377,67 +2103,6 @@ class System:
             logging.error(f"Failed to determine local address for {target}: {e}")
             return ""
 
-    @staticmethod
-    def uptime(env):
-        import re
-
-        try:
-            p = subprocess.Popen(['uptime'],
-                             stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT,
-                             encoding="utf8",
-                             env=env)
-            output, error = p.communicate()
-        except FileNotFoundError:
-            _note_missing_tool("uptime")
-            return System._uptime_from_proc()
-
-        # Example: ' 10:23:45 up 1 day,  2:34,  3 users,  load average: 0.00, 0.01, 0.05'
-        line = output.strip()
-        # Remove leading time and 'up'
-        if ' up ' in line:
-            line = line.split(' up ', 1)[1]
-
-        result = {"uptime": "", "users": "", "load": ""}
-
-        # Split off the load average first, since it contains its own commas
-        # and would otherwise get shredded by a naive comma-split below.
-        load_match = re.search(r'load averages?:\s*(.+)$', line, re.IGNORECASE)
-        if load_match:
-            result["load"] = f"load average: {load_match.group(1).strip()}"
-            line = line[:load_match.start()]
-
-        parts = [p.strip() for p in line.split(',') if p.strip()]
-        if parts:
-            result["uptime"] = parts[0]
-            # Find the part with 'user' or 'users'
-            for p in parts[1:]:
-                if 'user' in p:
-                    result["users"] = p
-        return result
-
-    def _uptime_from_proc():
-        result = {"uptime": "", "users": "", "load": ""}
-        seconds = System.host_uptime_seconds()
-        if seconds is not None:
-            seconds = int(seconds)
-            days, seconds = divmod(seconds, 86400)
-            hours, seconds = divmod(seconds, 3600)
-            minutes = seconds // 60
-            parts = []
-            if days:
-                parts.append(f"{days} day{'s' if days != 1 else ''}")
-            parts.append(f"{hours}:{minutes:02d}")
-            result["uptime"] = ", ".join(parts)
-
-        try:
-            with open('/proc/loadavg', encoding='utf-8') as f:
-                load1, load5, load15 = f.read().split()[:3]
-            result["load"] = f"load average: {load1}, {load5}, {load15}"
-        except Exception as e:
-            logging.error(f"Failed reading /proc/loadavg: {e}")
-
-        return result
 
 
 class Weather:
@@ -2449,146 +2114,61 @@ class Weather:
     def fetch_weather(self):
         url = f"https://wttr.in/{self.location}?format=j1"
         logging.info(f"iss-weather: Fetching weather for {self.location} at {url}")
-        data = None
-        icon = None
         try:
             response = requests.get(url, timeout=10)
             if response and response.content:
-                try:
-                    data = json.loads(response.content)
-                    icon = self.icon(data["current_condition"][0]["weatherDesc"][0]["value"])
-                except (ValueError, KeyError, IndexError) as e:
-                    logging.error("weather: Failed to decode or parse data")
-                    logging.error(e)
-                    data = None
-                    icon = None
-            else:
-                logging.error("Failed to fetch weather data: empty response")
+                return json.loads(response.content)
+            logging.error("Failed to fetch weather data: empty response")
         except requests.ReadTimeout as e:
             logging.error(f"weather: Timeout for request {e}")
+        except ValueError:
+            logging.error("weather: Failed to decode data")
         except Exception as e:
             logging.error(f"weather: Error requesting weather: {e}")
-        return data, icon
 
-    def icon(self, condition):
-        if condition in ("Sunny", "Clear"):
-            condition = "clear"
+        return None
 
-        fn = f"themes/default/weather/{condition}.svg"
-        if not os.path.exists(fn):
-            return False
-
-        return fn
-
-    def current_weather(self):
-        # Always return a tuple for unpacking
-        if self.weather is None:
-            return None, None
-        return self.weather
-
-    moon_icons = {"New Moon": "\U0001F311",
-                  "Waxing Crescent": "\U0001F312",
-                  "First Quarter": "\U0001F313",
-                  "Waxing Gibbous": "\U0001F314",
-                  "Full Moon": "\U0001F315",
-                  "Waning Gibbous": "\U0001F316",
-                  "Last Quarter": "\U0001F317",
-                  "Waning Crescent": "\U0001F318"}
-
-    def report(self):
+    def current(self):
         '''
-        The weather as lines: temperature, conditions and wind, the area,
-        sun and moon, and the uv index, plus the icon file
+        The current conditions as values, None where the source had nothing:
+        temperature, condition and its wttr code, wind, area, sunrise and
+        sunset, moon phase and days to full, uv index
         '''
-        texts = []
-        data, icon = self.current_weather()
-
-        if icon:
-            texts.append(icon)
-
-        if not data:
-            texts.append("Weather data unavailable")
-        else:
-            try:
-                current = data["current_condition"][0]
-                texts.append(current["temp_C"] + "°C")
-                texts.append(current["weatherDesc"][0]["value"]
-                             + " " + current["windspeedKmph"] + " km/h")
-                texts.append(data["nearest_area"][0]["areaName"][0]["value"])
-                texts.append("")
-            except (KeyError, IndexError, TypeError) as e:
+        out = {"temp_c": None, "condition": None, "condition_code": None,
+               "wind_kmh": None, "area": None, "sunrise": None, "sunset": None,
+               "moon_phase": None, "days_to_full_moon": None, "uv_index": None}
+        try:
+            now = self.weather["current_condition"][0]
+            out["temp_c"] = int(now["temp_C"])
+            out["condition"] = now["weatherDesc"][0]["value"]
+            out["condition_code"] = int(now.get("weatherCode") or 0) or None
+            out["wind_kmh"] = int(now["windspeedKmph"])
+            out["area"] = self.weather["nearest_area"][0]["areaName"][0]["value"]
+        except (KeyError, IndexError, TypeError, ValueError) as e:
+            if self.weather is not None:
                 logging.error(f"weather: Unexpected data format: {e}")
-                texts.append("Weather data unavailable")
 
-        sun = Calendar.sunrise_sunset(location=self.location)
-        today = (sun or {}).get("today", {})
-        if today.get("sunrise") and today.get("sunset"):
-            texts.append(f"Sunrise {today['sunrise']}  "
-                         f"Sunset {today['sunset']}")
-        else:
-            logging.info("weather: No sunrise/sunset data for "
-                         f"{self.location}: {sun}")
-
-        moon_phase, moon_icon, days_until_full = \
+        today = (Calendar.sunrise_sunset(location=self.location) or {}).get("today", {})
+        out["sunrise"] = today.get("sunrise") or None
+        out["sunset"] = today.get("sunset") or None
+        out["moon_phase"], _, out["days_to_full_moon"] = \
             Calendar.moonphase(location=self.location)
-        if moon_phase:
-            moon_char = self.moon_icons.get(moon_phase, "\U0001F319")
-            moon_line = f"{moon_char} Moon {moon_phase}"
-            if days_until_full is not None:
-                moon_line += f" ({days_until_full} days to full)"
-            # A blank line on each side sets the moon apart from the sun line
-            # above and the uv line below
-            texts.append("")
-            texts.append(moon_line)
-            texts.append("")
+        out["uv_index"] = Weather.fetch_uv_index(location=self.location)
 
-        uv_index = Weather.fetch_uv_index(location=self.location)
-        risk = Weather.uv_risk(uv_index)
-        if risk:
-            texts.append(risk)
-        elif uv_index:
-            texts.append(f"UV Index {uv_index}")
-
-        return texts, icon
+        return out
 
     @staticmethod
     def fetch_uv_index(location="Berlin"):
-        """
-        Fetches the UV index for the given location from wttr.in.
-        Returns:
-            str: The UV index as a string, or None on failure.
-        """
+        '''The uv index from wttr.in as a number, or None'''
         url = f"https://wttr.in/{location}?format=%u"
         try:
             response = requests.get(url, timeout=10)
             if response.status_code == 200:
-                return response.text.strip()
-            else:
-                logging.error(f"Failed to fetch UV index: HTTP {response.status_code}")
+                return float(response.text.strip())
+            logging.error(f"Failed to fetch UV index: HTTP {response.status_code}")
+        except (ValueError, TypeError):
+            logging.error("Failed to read the UV index")
         except Exception as e:
             logging.error(f"Error fetching UV index: {e}")
+
         return None
-
-    @staticmethod
-    def uv_risk(uv_index):
-        try:
-            uv = int(float(uv_index))
-        except (TypeError, ValueError):
-            return None
-
-        levels = [
-            (2,  "Low",       "No protection needed",            "No protection needed"),
-            (5,  "Moderate",  "Sunscreen recommended",           "Sunscreen and hat recommended"),
-            (7,  "High",      "Sunscreen essential, seek shade", "Limit midday exposure, hat and sunscreen"),
-            (10, "Very High", "Avoid midday sun",                "Avoid midday sun, stay in shade"),
-        ]
-
-        for max_uv, label, adult, children in levels:
-            if uv <= max_uv:
-                return (f"UV Index {uv} ({label})\n"
-                        f"Children: {children}\n"
-                        f"Adults: {adult}")
-
-        return (f"UV Index {uv} (Extreme)\n"
-                "Children: Keep indoors during peak hours\n"
-                "Adults: Avoid sun exposure")
