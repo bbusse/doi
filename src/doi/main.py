@@ -1454,6 +1454,7 @@ class System:
 
         return procs
 
+    @staticmethod
     def os_release():
         data = ""
         try:
@@ -1469,6 +1470,7 @@ class System:
             logging.error(f"Failed reading /etc/os-release: {e}")
         return data
 
+    @staticmethod
     def sysdata():
         '''The py3status sysdata line, cpu and memory as that module formats it'''
         return Py3status("sysdata").run_module()
@@ -1521,6 +1523,7 @@ class System:
 
         return rows
 
+    @staticmethod
     def net_data(probe_ip_address):
         net = {"address" : None,
                "addresses" : "",
@@ -1537,6 +1540,7 @@ class System:
 
         return net
 
+    @staticmethod
     def net_resolvconf():
         data = ""
         try:
@@ -2150,6 +2154,7 @@ class System:
             logging.warning(f"{ip_address} is an invalid IP address")
             return False
 
+    @staticmethod
     def net_iface_address(target):
         # target is an IP or a hostname. The local address facing it is the
         # source address the kernel assigns to a UDP socket connected toward
