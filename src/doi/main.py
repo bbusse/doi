@@ -835,97 +835,16 @@ class MQTT:
         client.message_callback_add(topic, on_message)
 
 
-class News:
+class Feed:
+    '''
+    Items fetched on first use rather than in __init__, so building a
+    playlist never blocks on the network, refetched once stale and handed
+    out in rotation. A failed refetch keeps the items held. A subclass reads
+    its source in _parse() and hands the items to _replace()
+    '''
 
-    def __init__(self, sources):
-        self.news = []
-        if sources.get("rss"):
-            self.rss_fetch(sources["rss"])
-        elif sources.get("db"):
-            self.sqlite_select(sources["db"], "SELECT feeds.title, entries.title, entries.link, entries.pub_date FROM entries INNER JOIN feeds ON entries.feed_id = feeds.id ORDER BY pub_date DESC LIMIT 9")
-
-    # news_item returns a single news text
-    # from the previously fetched ones
-    def news_item(self):
-        n = {"feed": "",
-             "title": "",
-             "url": ""}
-        if not self.news:
-            return None
-        try:
-            n["feed"] = self.news[0].get('feed')
-            n["title"] = self.news[0].get('title')
-            n["url"] = self.news[0].get('url')
-        finally:
-            # Remove the item even if some keys are missing
-            try:
-                self.news.pop(0)
-            except Exception:
-                pass
-        return n
-
-    def sqlite_select(self, db, query):
-        if not os.path.exists(db):
-            logging.error(f"News: Database does not exist {db}")
-            return False
-
-        con = None
-        try:
-            con = sqlite3.connect(db)
-            cur = con.cursor()
-            res = cur.execute(query)
-            r = res.fetchall()
-            for news in r:
-                logging.info("News: Appending news")
-                self.news.append({
-                    "feed": news[0],
-                    "title": news[1],
-                    "url": news[2]
-                })
-        except Exception as e:
-            logging.error(f"News: sqlite error: {e}")
-            return False
-        finally:
-            if con:
-                con.close()
-
-    def rss_fetch(self, url):
-        ATOM_NS = "http://www.w3.org/2005/Atom"
-        try:
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            root = ET.fromstring(resp.content)
-        except Exception as e:
-            logging.error(f"RSS: Failed to fetch {url}: {e}")
-            return
-
-        # RSS 2.0
-        channel = root.find("channel")
-        if channel is not None:
-            feed_title = (channel.findtext("title") or "").strip()
-            for item in channel.findall("item"):
-                title = (item.findtext("title") or "").strip()
-                link = (item.findtext("link") or "").strip()
-                if title:
-                    self.news.append({"feed": feed_title, "title": title, "url": link})
-        else:
-            # Atom
-            feed_title = (root.findtext(f"{{{ATOM_NS}}}title") or "").strip()
-            for entry in root.findall(f"{{{ATOM_NS}}}entry"):
-                title = (entry.findtext(f"{{{ATOM_NS}}}title") or "").strip()
-                link_el = entry.find(f"{{{ATOM_NS}}}link")
-                link = (link_el.get("href", "") if link_el is not None else "").strip()
-                if title:
-                    self.news.append({"feed": feed_title, "title": title, "url": link})
-
-        random.shuffle(self.news)
-        logging.info(f"RSS: Fetched {len(self.news)} items from {url}")
-
-class RSSFeed:
-    ATOM_NS = "http://www.w3.org/2005/Atom"
-
-    def __init__(self, url, refetch_after_s=600, retry_after_s=60):
-        self.url = url
+    def __init__(self, source, refetch_after_s=600, retry_after_s=60):
+        self.source = source
         self._items = []
         self._refresh = Refresh(refetch_after_s, retry_after_s)
         self._lock = threading.Lock()
@@ -933,12 +852,46 @@ class RSSFeed:
     def item_count(self):
         return len(self._items)
 
-    # Fetched on first use rather than in __init__, so building a playlist
-    # never blocks on the network. A failed refetch keeps the items held
     def fetch(self):
         with self._lock:
             if self._refresh.due():
                 self._refresh.done(self._parse())
+
+    def _replace(self, items, shuffle=False):
+        name = type(self).__name__
+        if not items:
+            logging.warning(f"{name}: No items in {self.source}")
+            return False
+
+        # Source order is the ranking, so it is recorded before shuffling
+        for rank, item in enumerate(items, start=1):
+            item["rank"] = rank
+        if shuffle:
+            random.shuffle(items)
+        self._items = items
+        logging.info(f"{name}: Fetched {len(items)} items from {self.source}")
+
+        return True
+
+    def news_item(self):
+        self.fetch()
+        if not self._items:
+            return None
+
+        # Rotate, so repeated calls cycle through the feed
+        # instead of consuming it and then running dry
+        item = self._items.pop(0)
+        self._items.append(item)
+
+        return item
+
+
+class RSSFeed(Feed):
+    ATOM_NS = "http://www.w3.org/2005/Atom"
+
+    def __init__(self, url, refetch_after_s=600, retry_after_s=60):
+        super().__init__(url, refetch_after_s, retry_after_s)
+        self.url = url
 
     def _parse(self):
         url = self.url
@@ -967,30 +920,48 @@ class RSSFeed:
             logging.error(f"RSS: Failed to fetch {url}: {e}")
             return False
 
-        if not items:
-            logging.warning(f"RSS: No items in {url}")
+        return self._replace(items, shuffle=True)
+
+
+class SQLiteFeed(Feed):
+    '''The newest entries of a feed reader database'''
+
+    query = ("SELECT feeds.title, entries.title, entries.link FROM entries "
+             "INNER JOIN feeds ON entries.feed_id = feeds.id "
+             "ORDER BY pub_date DESC LIMIT 9")
+
+    def _parse(self):
+        # connect() would create a missing file
+        if not os.path.exists(self.source):
+            logging.error(f"SQLiteFeed: Database does not exist {self.source}")
             return False
 
-        # Feed order is the ranking, so it is recorded before shuffling
-        for rank, item in enumerate(items, start=1):
-            item["rank"] = rank
-        random.shuffle(items)
-        self._items = items
-        logging.info(f"RSS: Fetched {len(items)} items from {url}")
+        try:
+            con = sqlite3.connect(self.source)
+            try:
+                rows = con.execute(self.query).fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error as e:
+            logging.error(f"SQLiteFeed: {self.source}: {e}")
+            return False
 
-        return True
+        return self._replace([{"feed": feed, "title": title, "url": url}
+                              for feed, title, url in rows])
+
+
+class News:
+    '''News items from the rss feed or the feed reader database in sources'''
+
+    def __init__(self, sources):
+        self._feed = None
+        if sources.get("rss"):
+            self._feed = RSSFeed(sources["rss"])
+        elif sources.get("db"):
+            self._feed = SQLiteFeed(sources["db"])
 
     def news_item(self):
-        self.fetch()
-        if not self._items:
-            return None
-
-        # Rotate, so repeated calls cycle through the feed
-        # instead of consuming it and then running dry
-        item = self._items.pop(0)
-        self._items.append(item)
-
-        return item
+        return self._feed.news_item() if self._feed else None
 
 
 class OTD:
