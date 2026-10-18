@@ -39,8 +39,14 @@ class FileCache:
     def path(self, key):
         name = self.name(key)
         for entry in self.entries():
-            if entry.name.startswith(name) and entry.stat().st_size > 0:
-                return entry.path
+            if not entry.name.startswith(name):
+                continue
+            # pruned by another thread between the listing and here
+            try:
+                if entry.stat().st_size > 0:
+                    return entry.path
+            except OSError:
+                continue
 
         return None
 
@@ -68,19 +74,28 @@ class FileCache:
             if os.path.exists(tmp):
                 os.remove(tmp)
             raise
-        self.prune()
+        self.prune(keep=path)
 
         return path
 
-    def prune(self):
-        entries = sorted(self.entries(), key=lambda e: e.stat().st_mtime,
-                         reverse=True)
-        kept = 0
-        for entry in entries:
-            kept += entry.stat().st_size
-            if kept > self.max_bytes:
+    # Newest first until the cap is passed, the rest go. keep is never
+    # removed, so a file over the cap on its own is still there for the
+    # caller that was just handed its path
+    def prune(self, keep=None):
+        sized = []
+        for entry in self.entries():
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            sized.append((st.st_mtime, st.st_size, entry.path))
+
+        total = 0
+        for _, size, path in sorted(sized, reverse=True):
+            total += size
+            if total > self.max_bytes and path != keep:
                 try:
-                    os.remove(entry.path)
+                    os.remove(path)
                 except OSError:
                     pass
 

@@ -11,6 +11,8 @@ import doi.main as main
 from doi.main import (Calendar, Music, News, OTD, PrometheusClient,
                       Weather)
 
+JPEG = b"\xff\xd8\xff\xe0jpegbytes"
+
 
 class TestCalendarMonth(unittest.TestCase):
     def test_month_shape(self):
@@ -123,14 +125,14 @@ class TestCacheImage(unittest.TestCase):
 
         def get(url, **kw):
             calls.append(url)
-            return Reply(200, content=b"jpegbytes")
+            return Reply(200, content=JPEG)
 
         with mock.patch.object(main.requests, "get", get):
             first = main.cache_image("http://img/a.jpg", main.FileCache(tmp))
             second = main.cache_image("http://img/a.jpg", main.FileCache(tmp))
 
         self.assertEqual(first, second)
-        self.assertEqual(open(first, "rb").read(), b"jpegbytes")
+        self.assertEqual(open(first, "rb").read(), JPEG)
         self.assertEqual(len(calls), 1)
 
     def test_fetch_failure(self):
@@ -168,6 +170,33 @@ class TestCacheImage(unittest.TestCase):
             self.assertTrue(
                 main.cache_image("http://img/x", main.FileCache(tmp)).endswith(".png"))
 
+    def fetch(self, content, content_type=None):
+        import tempfile
+        headers = {"Content-Type": content_type} if content_type else {}
+        store = main.FileCache(tempfile.mkdtemp(prefix="doi-img-"))
+        with mock.patch.object(main.requests, "get", lambda url, **kw:
+                               Reply(200, content=content, headers=headers)):
+            return main.cache_image("http://img/x", store), store
+
+    def test_error_page_is_not_cached(self):
+        path, store = self.fetch(b"<html>sign in</html>", "text/html")
+        self.assertEqual(path, "")
+        self.assertIsNone(store.path("http://img/x"))
+
+    def test_html_with_no_content_type_is_not_cached(self):
+        self.assertEqual(self.fetch(b"<html>sign in</html>")[0], "")
+
+    def test_empty_body_is_not_cached(self):
+        self.assertEqual(self.fetch(b"", "image/jpeg")[0], "")
+
+    def test_generic_type_needs_image_bytes(self):
+        octet = "application/octet-stream"
+        self.assertTrue(self.fetch(JPEG, octet)[0].endswith(".jpg"))
+        self.assertEqual(self.fetch(b"not an image", octet)[0], "")
+
+    def test_missing_content_type_needs_image_bytes(self):
+        self.assertTrue(self.fetch(JPEG)[0].endswith(".jpg"))
+
     def test_extension_defaults_to_jpg(self):
         self.assertEqual(main.image_extension(None, b"not an image"), ".jpg")
         self.assertEqual(main.image_extension("image/jpeg", b""), ".jpg")
@@ -187,14 +216,14 @@ class TestApod(unittest.TestCase):
         def get(url, **kw):
             if "api.nasa.gov" in url:
                 return Reply(200, payload)
-            return Reply(200, content=b"jpegbytes")
+            return Reply(200, content=JPEG)
 
         with mock.patch.object(main.requests, "get", get):
             apod = APOD(store=main.FileCache(tempfile.mkdtemp(prefix="doi-test-apod-")))
             img_path, meta = apod.apod_data()
 
         self.assertTrue(img_path.endswith(".jpg"))
-        self.assertEqual(open(img_path, "rb").read(), b"jpegbytes")
+        self.assertEqual(open(img_path, "rb").read(), JPEG)
         self.assertEqual(meta["title"], "Eclipse Pair")
         self.assertEqual(meta["artist"], "Jane Doe")
         self.assertEqual(meta["source"], "NASA APOD")
@@ -250,7 +279,7 @@ class TestSpotify(unittest.TestCase):
         def get(url, **kw):
             gets.append((url, kw))
             if "img" in url:
-                return Reply(200, content=b"jpeg")
+                return Reply(200, content=JPEG)
             return Reply(200, SPOTIFY_PLAYING)
 
         import tempfile
@@ -353,7 +382,7 @@ class TestArtNGA(unittest.TestCase):
         def get(url, **kw):
             if "published_images.csv" in url:
                 return Reply(200, text="fragment\n" + self.row + "\n")
-            return Reply(200, content=b"jpegbytes")
+            return Reply(200, content=JPEG)
 
         meta = {"title": "Irises", "artist": "van Gogh", "date": "1889",
                 "medium": "oil on canvas"}
@@ -364,7 +393,7 @@ class TestArtNGA(unittest.TestCase):
                 store=main.FileCache(tempfile.mkdtemp(prefix="doi-test-nga-"))).art_data()
 
         self.assertTrue(path.endswith(".jpg"))
-        self.assertEqual(open(path, "rb").read(), b"jpegbytes")
+        self.assertEqual(open(path, "rb").read(), JPEG)
         self.assertEqual(out["source"], "National Gallery of Art")
         self.assertEqual(out["description"], "A field of irises")
         self.assertEqual((out["title"], out["artist"], out["date"]),
@@ -387,14 +416,14 @@ class TestArtMet(unittest.TestCase):
                 return Reply(200, {"objectIDs": [436535]})
             if "/objects/" in url:
                 return Reply(200, self.OBJECT)
-            return Reply(200, content=b"jpegbytes")
+            return Reply(200, content=JPEG)
 
         with mock.patch.object(main.requests, "get", get):
             path, work = main.ArtMet(
                 store=main.FileCache(tempfile.mkdtemp(prefix="doi-test-met-"))).art_data()
 
         self.assertTrue(path.endswith(".jpg"))
-        self.assertEqual(open(path, "rb").read(), b"jpegbytes")
+        self.assertEqual(open(path, "rb").read(), JPEG)
         self.assertEqual(work["source"], "The Metropolitan Museum of Art")
         self.assertEqual((work["title"], work["artist"], work["date"]),
                          ("Wheat Field with Cypresses", "Vincent van Gogh", "1889"))
@@ -552,7 +581,7 @@ BSKY_FEED = {"feed": [
 
 
 class TestBluesky(unittest.TestCase):
-    def transport(self, payload=BSKY_FEED, image=b"jpegbytes"):
+    def transport(self, payload=BSKY_FEED, image=JPEG):
         calls = []
 
         def get(url, **kw):
@@ -629,7 +658,7 @@ class TestBluesky(unittest.TestCase):
             item = bsky.post_item()          # ddd444, the picture
             self.assertEqual(item["image_url"], "https://cdn.bsky.app/img/f/1.jpg")
             self.assertTrue(item["image"].endswith(".jpg"))
-            self.assertEqual(open(item["image"], "rb").read(), b"jpegbytes")
+            self.assertEqual(open(item["image"], "rb").read(), JPEG)
             downloads = [c for c in calls if isinstance(c, str)]
             # rotate all the way back round to the same post
             for _ in range(len(bsky._items)):

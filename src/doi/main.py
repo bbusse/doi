@@ -32,18 +32,22 @@ def skip_comments(file):
 
 
 # Content-Type first, then the magic bytes, so the cached file's extension
-# matches what a viewer will find inside it -- a webp saved as .jpg trips up
+# matches what a viewer will find inside it. A webp saved as .jpg trips up
 # loaders that trust the name
 _IMAGE_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
               "image/webp": ".webp", "image/avif": ".avif",
               "image/svg+xml": ".svg", "image/bmp": ".bmp",
               "image/tiff": ".tiff"}
 
+# Types that say nothing about the body, so the bytes decide
+_GENERIC_TYPES = ("", "application/octet-stream", "binary/octet-stream")
 
-def image_extension(content_type, content):
-    ct = (content_type or "").split(";", 1)[0].strip().lower()
-    if ct in _IMAGE_EXT:
-        return _IMAGE_EXT[ct]
+
+def _media_type(content_type):
+    return (content_type or "").split(";", 1)[0].strip().lower()
+
+
+def _sniff_image(content):
     if content[:3] == b"\xff\xd8\xff":
         return ".jpg"
     if content[:8] == b"\x89PNG\r\n\x1a\n":
@@ -55,14 +59,31 @@ def image_extension(content_type, content):
     head = content[:64].lstrip()
     if head[:5] == b"<?xml" or head[:4] == b"<svg":
         return ".svg"
-    return ".jpg"
+
+    return None
+
+
+def image_extension(content_type, content):
+    return (_IMAGE_EXT.get(_media_type(content_type))
+            or _sniff_image(content) or ".jpg")
+
+
+def is_image(content_type, content):
+    if not content:
+        return False
+    media_type = _media_type(content_type)
+    if media_type.startswith("image/"):
+        return True
+
+    return media_type in _GENERIC_TYPES and _sniff_image(content) is not None
 
 
 def cache_image(url, store=None, timeout=10):
     '''
     A picture by url as a local file, fetched once and kept in the store, the
     shared cache unless one is given. The extension follows the response
-    Content-Type. Empty string on no url or a failed fetch
+    Content-Type. Empty string on no url, a failed fetch or a body that is
+    not an image, so an error page is never cached as a picture
     '''
     if not url:
         return ""
@@ -75,9 +96,14 @@ def cache_image(url, store=None, timeout=10):
     try:
         resp = requests.get(url, timeout=timeout)
         resp.raise_for_status()
-        ext = image_extension(resp.headers.get("Content-Type"), resp.content)
+        content_type = resp.headers.get("Content-Type")
+        if not is_image(content_type, resp.content):
+            logging.warning(f"cache_image: {url}: not an image "
+                            f"({content_type or 'no content type'})")
+            return ""
 
-        return store.put(url, resp.content, ext)
+        return store.put(url, resp.content,
+                         image_extension(content_type, resp.content))
     except (requests.RequestException, OSError) as e:
         logging.warning(f"cache_image: {url}: {e}")
         return ""

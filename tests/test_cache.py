@@ -55,6 +55,25 @@ class TestFileCache(unittest.TestCase):
         self.assertTrue(os.path.exists(second))
         self.assertTrue(os.path.exists(third))
 
+    def test_oversize_entry_survives_its_own_prune(self):
+        cache = FileCache(self.dir, max_bytes=4)
+        path = cache.put("http://img/big", b"0123456789")
+        self.assertTrue(os.path.exists(path))
+
+    def test_entry_pruned_mid_lookup(self):
+        # listed, then removed by another thread before it is stat'ed
+        gone = mock.Mock()
+        gone.name = self.cache.name("http://img/a") + ".jpg"
+        gone.stat.side_effect = FileNotFoundError
+        with mock.patch.object(self.cache, "entries", return_value=[gone]):
+            self.assertIsNone(self.cache.path("http://img/a"))
+
+    def test_prune_skips_an_entry_removed_mid_scan(self):
+        gone = mock.Mock()
+        gone.stat.side_effect = FileNotFoundError
+        with mock.patch.object(self.cache, "entries", return_value=[gone]):
+            self.cache.prune()
+
     def test_directory_from_env(self):
         with mock.patch.dict(os.environ, {"CACHE_DIR": self.dir}):
             self.assertEqual(FileCache().directory, self.dir)
