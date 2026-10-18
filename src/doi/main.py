@@ -146,11 +146,13 @@ class APOD:
 
     def apod_data(self):
         """
-        Downloads NASA's Astronomy Picture of the Day (APOD).
+        NASA's Astronomy Picture of the Day, the picture fetched once into
+        the store.
         Returns:
-            tuple: (image_path, meta) or (None, None) on failure. meta is the
-            same shape the art sources return, so Art.caption formats it:
-            title, artist (the credit), date, source and a description.
+            tuple: (image_path, meta), (None, meta) when there is no usable
+            picture and (None, None) when the day's entry could not be read.
+            meta has title, artist (the credit), date, source and a
+            description.
         """
         # thumbs=True asks the api for a poster frame on the days the picture
         # is actually a video
@@ -179,18 +181,7 @@ class APOD:
                                 f"(media_type={data.get('media_type')})")
                 return None, meta
 
-            img_resp = requests.get(img_url, timeout=10)
-            if img_resp.status_code != 200:
-                logging.error(f"APOD: Failed to download image: {img_resp.status_code}")
-                return None, meta
-            content_type = img_resp.headers.get("Content-Type", "")
-            if content_type and not content_type.startswith("image/"):
-                logging.warning(f"APOD: {img_url} served {content_type}, skipping")
-                return None, meta
-
-            img_ext = os.path.splitext(img_url.split("?", 1)[0])[-1] or ".jpg"
-
-            return self.store.put(img_url, img_resp.content, img_ext), meta
+            return cache_image(img_url, self.store) or None, meta
         except Exception as e:
             logging.error(f"APOD: Error fetching APOD: {e}")
             return None, None
