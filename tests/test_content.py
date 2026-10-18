@@ -580,6 +580,68 @@ BSKY_FEED = {"feed": [
 ]}
 
 
+class TestRSSFeedRefresh(unittest.TestCase):
+    URL = "https://example.com/feed.xml"
+
+    def feed(self, *replies):
+        # one reply per fetch, in order
+        calls = []
+
+        def get(url, **kw):
+            calls.append(url)
+            return replies[len(calls) - 1]
+
+        return main.RSSFeed(self.URL), get, calls
+
+    def expire(self, feed):
+        feed._attempted_at -= feed._wait + 1
+
+    def test_failed_first_fetch_is_retried(self):
+        feed, get, calls = self.feed(Reply(503), Reply(200, content=RSS_XML))
+        with mock.patch.object(main.requests, "get", get):
+            self.assertIsNone(feed.news_item())
+            self.expire(feed)
+            self.assertIsNotNone(feed.news_item())
+        self.assertEqual(len(calls), 2)
+
+    def test_dead_feed_is_not_hit_on_every_call(self):
+        feed, get, calls = self.feed(Reply(503))
+        with mock.patch.object(main.requests, "get", get):
+            for _ in range(5):
+                feed.news_item()
+        self.assertEqual(len(calls), 1)
+
+    def test_refetched_once_stale(self):
+        feed, get, calls = self.feed(Reply(200, content=RSS_XML),
+                                     Reply(200, content=RSS_XML))
+        with mock.patch.object(main.requests, "get", get):
+            feed.news_item()
+            feed.news_item()
+            self.assertEqual(len(calls), 1)
+            self.expire(feed)
+            feed.news_item()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(feed.item_count(), 2)
+
+    def test_failed_refetch_keeps_items(self):
+        feed, get, calls = self.feed(Reply(200, content=RSS_XML), Reply(503))
+        with mock.patch.object(main.requests, "get", get):
+            feed.news_item()
+            self.expire(feed)
+            self.assertIsNotNone(feed.news_item())
+        self.assertEqual(feed.item_count(), 2)
+
+    def test_empty_feed_does_not_wipe_items(self):
+        empty = b'<rss version="2.0"><channel><title>t</title></channel></rss>'
+        feed, get, calls = self.feed(Reply(200, content=RSS_XML),
+                                     Reply(200, content=empty))
+        with mock.patch.object(main.requests, "get", get):
+            feed.news_item()
+            self.expire(feed)
+            feed.news_item()
+        self.assertEqual(feed.item_count(), 2)
+
+
 class TestBluesky(unittest.TestCase):
     def transport(self, payload=BSKY_FEED, image=JPEG):
         calls = []

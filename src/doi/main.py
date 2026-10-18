@@ -883,27 +883,36 @@ class News:
 
 class RSSFeed:
     ATOM_NS = "http://www.w3.org/2005/Atom"
+    # Items are refetched once this stale, a failed fetch is retried sooner
+    # but not on every call, so a dead feed cannot stall a polling view
+    refetch_after_s = 600
+    retry_after_s = 60
 
     def __init__(self, url):
         self.url = url
         self._items = []
-        self._fetched = False
+        self._attempted_at = None
+        self._wait = 0
         self._lock = threading.Lock()
 
     def item_count(self):
         return len(self._items)
 
     # Fetched on first use rather than in __init__, so building a playlist
-    # never blocks on the network
+    # never blocks on the network. A failed refetch keeps the items held
     def fetch(self):
         with self._lock:
-            if self._fetched:
+            now = time.monotonic()
+            if (self._attempted_at is not None
+                    and now - self._attempted_at < self._wait):
                 return
-            self._fetched = True
-            self._parse()
+            self._attempted_at = now
+            ok = self._parse()
+            self._wait = self.refetch_after_s if ok else self.retry_after_s
 
     def _parse(self):
         url = self.url
+        items = []
         try:
             resp = requests.get(url, timeout=10)
             resp.raise_for_status()
@@ -915,7 +924,7 @@ class RSSFeed:
                     title = (item.findtext("title") or "").strip()
                     link = (item.findtext("link") or "").strip()
                     if title:
-                        self._items.append({"feed": feed_title, "title": title, "url": link})
+                        items.append({"feed": feed_title, "title": title, "url": link})
             else:
                 feed_title = (root.findtext(f"{{{self.ATOM_NS}}}title") or "").strip()
                 for entry in root.findall(f"{{{self.ATOM_NS}}}entry"):
@@ -923,14 +932,23 @@ class RSSFeed:
                     link_el = entry.find(f"{{{self.ATOM_NS}}}link")
                     link = (link_el.get("href", "") if link_el is not None else "").strip()
                     if title:
-                        self._items.append({"feed": feed_title, "title": title, "url": link})
-            # Feed order is the ranking, so it is recorded before shuffling
-            for rank, item in enumerate(self._items, start=1):
-                item["rank"] = rank
-            random.shuffle(self._items)
-            logging.info(f"RSS: Fetched {len(self._items)} items from {url}")
+                        items.append({"feed": feed_title, "title": title, "url": link})
         except Exception as e:
             logging.error(f"RSS: Failed to fetch {url}: {e}")
+            return False
+
+        if not items:
+            logging.warning(f"RSS: No items in {url}")
+            return False
+
+        # Feed order is the ranking, so it is recorded before shuffling
+        for rank, item in enumerate(items, start=1):
+            item["rank"] = rank
+        random.shuffle(items)
+        self._items = items
+        logging.info(f"RSS: Fetched {len(items)} items from {url}")
+
+        return True
 
     def news_item(self):
         self.fetch()
