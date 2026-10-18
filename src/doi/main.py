@@ -140,9 +140,16 @@ def cache_image(url, store=None, timeout=10):
 
 class APOD:
 
-    def __init__(self, api_key="DEMO_KEY", store=None):
+    # The entry changes once a day, so it is asked for hourly at most. That
+    # keeps a polling view inside the DEMO_KEY rate limit, and a failure is
+    # retried less eagerly still
+    def __init__(self, api_key="DEMO_KEY", store=None, refetch_after_s=3600,
+                 retry_after_s=300):
         self.api_key = api_key
         self.store = store or cache
+        self._entry = (None, None)
+        self._refresh = Refresh(refetch_after_s, retry_after_s)
+        self._lock = threading.Lock()
 
     def apod_data(self):
         """
@@ -150,10 +157,23 @@ class APOD:
         the store.
         Returns:
             tuple: (image_path, meta), (None, meta) when there is no usable
-            picture and (None, None) when the day's entry could not be read.
-            meta has title, artist (the credit), date, source and a
-            description.
+            picture and (None, None) when no entry could be read yet. meta
+            has title, artist (the credit), date, source and a description.
+            A failed refetch keeps the entry held.
         """
+        with self._lock:
+            if self._refresh.due():
+                entry, complete = self._fetch()
+                # An entry without its picture never replaces one held
+                if entry and (complete or not self._entry[1]):
+                    self._entry = entry
+                self._refresh.done(complete)
+
+            return self._entry
+
+    # The entry and whether it is complete: a day without a picture is, a
+    # picture that failed to download is not
+    def _fetch(self):
         # thumbs=True asks the api for a poster frame on the days the picture
         # is actually a video
         apod_url = (f"https://api.nasa.gov/planetary/apod?api_key={self.api_key}"
@@ -162,7 +182,7 @@ class APOD:
             resp = requests.get(apod_url, timeout=10)
             if resp.status_code != 200:
                 logging.error(f"APOD: Failed to fetch metadata: {resp.status_code}")
-                return None, None
+                return None, False
             data = resp.json()
 
             meta = {"title": data.get("title", ""),
@@ -179,12 +199,14 @@ class APOD:
             if not img_url:
                 logging.warning("APOD: no image today "
                                 f"(media_type={data.get('media_type')})")
-                return None, meta
+                return (None, meta), True
 
-            return cache_image(img_url, self.store) or None, meta
+            path = cache_image(img_url, self.store) or None
+
+            return (path, meta), path is not None
         except Exception as e:
             logging.error(f"APOD: Error fetching APOD: {e}")
-            return None, None
+            return None, False
 
 
 class Art:
