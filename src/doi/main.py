@@ -31,6 +31,35 @@ def skip_comments(file):
             yield line.strip()
 
 
+class Refresh:
+    '''
+    Pacing for a source asked again once its data is stale: wait ok_s after a
+    good fetch and retry_s after a failed one, so a dead upstream is not hit
+    on every poll of a view
+    '''
+
+    def __init__(self, ok_s=600, retry_s=60):
+        self.ok_s = ok_s
+        self.retry_s = retry_s
+        self._at = None
+        self._wait = 0
+
+    def due(self):
+        return self._at is None or time.monotonic() - self._at >= self._wait
+
+    def done(self, ok):
+        self._at = time.monotonic()
+        self._wait = self.ok_s if ok else self.retry_s
+
+
+def wttr_forecast(location):
+    '''The wttr.in j1 forecast for a location, raises on any failure'''
+    resp = requests.get(f"https://wttr.in/{location}?format=j1", timeout=10)
+    resp.raise_for_status()
+
+    return resp.json()
+
+
 # Content-Type first, then the magic bytes, so the cached file's extension
 # matches what a viewer will find inside it. A webp saved as .jpg trips up
 # loaders that trust the name
@@ -660,18 +689,17 @@ class Calendar:
 
 
     @staticmethod
-    def moonphase(location="Berlin"):
+    def moonphase(location="Berlin", data=None):
         """
-        Fetches the current moon phase and icon from wttr.in for the given location.
+        The current moon phase and icon from wttr.in for the given location,
+        from the forecast in data when the caller already holds one.
         Returns:
             tuple: (moon_phase_text, moon_icon_url, days_until_full_moon) or (None, None, None) on failure.
         """
         import datetime
 
-        url = f"https://wttr.in/{location}?format=j1"
         try:
-            resp = requests.get(url, timeout=10)
-            data = resp.json()
+            data = data or wttr_forecast(location)
             # The moon phase is in the first day's astronomy section
             moon_phase = data["weather"][0]["astronomy"][0]["moon_phase"]
             moon_icon = data["weather"][0]["astronomy"][0].get("moon_icon", None)
@@ -711,9 +739,10 @@ class Calendar:
 
 
     @staticmethod
-    def sunrise_sunset(location="Berlin"):
+    def sunrise_sunset(location="Berlin", data=None):
         """
-        Fetches sunrise and sunset times for today and tomorrow from wttr.in for the given location.
+        Sunrise and sunset times for today and tomorrow from wttr.in for the given
+        location, from the forecast in data when the caller already holds one.
         Returns:
             dict: {
                 "today": {"sunrise": str, "sunset": str},
@@ -721,10 +750,8 @@ class Calendar:
             }
             or None on failure.
         """
-        url = f"https://wttr.in/{location}?format=j1"
         try:
-            resp = requests.get(url, timeout=10)
-            data = resp.json()
+            data = data or wttr_forecast(location)
             result = {}
             weather = data.get("weather", [])
             for idx, key in zip([0, 1], ["today", "tomorrow"]):
@@ -883,16 +910,11 @@ class News:
 
 class RSSFeed:
     ATOM_NS = "http://www.w3.org/2005/Atom"
-    # Items are refetched once this stale, a failed fetch is retried sooner
-    # but not on every call, so a dead feed cannot stall a polling view
-    refetch_after_s = 600
-    retry_after_s = 60
 
-    def __init__(self, url):
+    def __init__(self, url, refetch_after_s=600, retry_after_s=60):
         self.url = url
         self._items = []
-        self._attempted_at = None
-        self._wait = 0
+        self._refresh = Refresh(refetch_after_s, retry_after_s)
         self._lock = threading.Lock()
 
     def item_count(self):
@@ -902,13 +924,8 @@ class RSSFeed:
     # never blocks on the network. A failed refetch keeps the items held
     def fetch(self):
         with self._lock:
-            now = time.monotonic()
-            if (self._attempted_at is not None
-                    and now - self._attempted_at < self._wait):
-                return
-            self._attempted_at = now
-            ok = self._parse()
-            self._wait = self.refetch_after_s if ok else self.retry_after_s
+            if self._refresh.due():
+                self._refresh.done(self._parse())
 
     def _parse(self):
         url = self.url
@@ -2151,18 +2168,28 @@ class System:
 
 class Weather:
 
-    def __init__(self, location):
+    def __init__(self, location, refetch_after_s=600, retry_after_s=60):
         self.location = location
-        self.weather = self.fetch_weather()
+        self.weather = None
+        self._refresh = Refresh(refetch_after_s, retry_after_s)
+        self._lock = threading.Lock()
+
+    # Lazy, so construction never blocks on the network. The one forecast
+    # feeds the conditions, sun, moon and uv index, and a failed refetch
+    # keeps the last one
+    def fetch(self):
+        with self._lock:
+            if not self._refresh.due():
+                return
+            data = self.fetch_weather()
+            if data:
+                self.weather = data
+            self._refresh.done(bool(data))
 
     def fetch_weather(self):
-        url = f"https://wttr.in/{self.location}?format=j1"
-        logging.info(f"iss-weather: Fetching weather for {self.location} at {url}")
+        logging.info(f"iss-weather: Fetching weather for {self.location}")
         try:
-            response = requests.get(url, timeout=10)
-            if response and response.content:
-                return json.loads(response.content)
-            logging.error("Failed to fetch weather data: empty response")
+            return wttr_forecast(self.location)
         except requests.ReadTimeout as e:
             logging.error(f"weather: Timeout for request {e}")
         except ValueError:
@@ -2178,9 +2205,13 @@ class Weather:
         temperature, condition and its wttr code, wind, area, sunrise and
         sunset, moon phase and days to full, uv index
         '''
+        self.fetch()
         out = {"temp_c": None, "condition": None, "condition_code": None,
                "wind_kmh": None, "area": None, "sunrise": None, "sunset": None,
                "moon_phase": None, "days_to_full_moon": None, "uv_index": None}
+        if not self.weather:
+            return out
+
         try:
             now = self.weather["current_condition"][0]
             out["temp_c"] = int(now["temp_C"])
@@ -2188,31 +2219,15 @@ class Weather:
             out["condition_code"] = int(now.get("weatherCode") or 0) or None
             out["wind_kmh"] = int(now["windspeedKmph"])
             out["area"] = self.weather["nearest_area"][0]["areaName"][0]["value"]
+            out["uv_index"] = float(now["uvIndex"])
         except (KeyError, IndexError, TypeError, ValueError) as e:
-            if self.weather is not None:
-                logging.error(f"weather: Unexpected data format: {e}")
+            logging.error(f"weather: Unexpected data format: {e}")
 
-        today = (Calendar.sunrise_sunset(location=self.location) or {}).get("today", {})
+        sun = Calendar.sunrise_sunset(self.location, self.weather)
+        today = (sun or {}).get("today", {})
         out["sunrise"] = today.get("sunrise") or None
         out["sunset"] = today.get("sunset") or None
         out["moon_phase"], _, out["days_to_full_moon"] = \
-            Calendar.moonphase(location=self.location)
-        out["uv_index"] = Weather.fetch_uv_index(location=self.location)
+            Calendar.moonphase(self.location, self.weather)
 
         return out
-
-    @staticmethod
-    def fetch_uv_index(location="Berlin"):
-        '''The uv index from wttr.in as a number, or None'''
-        url = f"https://wttr.in/{location}?format=%u"
-        try:
-            response = requests.get(url, timeout=10)
-            if response.status_code == 200:
-                return float(response.text.strip())
-            logging.error(f"Failed to fetch UV index: HTTP {response.status_code}")
-        except (ValueError, TypeError):
-            logging.error("Failed to read the UV index")
-        except Exception as e:
-            logging.error(f"Error fetching UV index: {e}")
-
-        return None
